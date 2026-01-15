@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>單一個股回測</title>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+      label { display: inline-flex; flex-direction: column; gap: 6px; font-size: 14px; }
+      input, select { padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; min-width: 160px; }
+      button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      .card { border: 1px solid #eee; border-radius: 14px; padding: 16px; margin-top: 16px; }
+      #chart { height: 560px; }
+      .hint { color:#6b7280; font-size:12px; margin-top:6px; }
+    </style>
+  </head>
+  <body>
+    <h2>單一個股回測：{{ stock_id }}</h2>
+
+    <div class="card">
+      <div class="row">
+        <label>開始日
+          <input id="start" value="{{ default_start }}" />
+        </label>
+        <label>結束日
+          <input id="end" value="{{ default_end }}" />
+        </label>
+        <label>方向
+          <select id="side">
+            <option value="long" selected>多</option>
+            <option value="short">空</option>
+          </select>
+        </label>
+        <label>entry_min_score
+          <input id="entry_min_score" type="number" value="{{ default_entry_min_score }}" />
+        </label>
+        <label>沒動能連續 N 天出場
+          <input id="exit_no_momentum_days" type="number" value="2" />
+        </label>
+        <label>初始資金
+          <input id="initial_capital" type="number" value="1000000" />
+        </label>
+        <label>部位大小
+          <select id="position_sizing">
+            <option value="fixed" selected>固定金額</option>
+            <option value="percent">依資金比例（複利）</option>
+          </select>
+        </label>
+        <label>每次進場金額
+          <input id="entry_amount" type="number" value="100000" />
+        </label>
+        <label>每次投入比例（0~1）
+          <input id="entry_pct" type="number" step="0.01" value="0.10" />
+        </label>
+        <label>買手續費率
+          <input id="buy_fee_rate" type="number" step="0.0001" value="0.001425" />
+        </label>
+        <label>賣手續費率
+          <input id="sell_fee_rate" type="number" step="0.0001" value="0.001425" />
+        </label>
+        <label>賣出交易稅率
+          <input id="sell_tax_rate" type="number" step="0.0001" value="0.003" />
+        </label>
+        <label>停損
+          <select id="use_stop_loss">
+            <option value="true" selected>開</option>
+            <option value="false">關</option>
+          </select>
+        </label>
+        <button id="runBtn" onclick="run()">更新</button>
+      </div>
+      <div class="hint">箭頭：綠色=進場、紅色=出場（停損會標示 SL）</div>
+    </div>
+
+    <div class="card">
+      <div id="chart"></div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:8px;">進出場依據</div>
+      <div id="summary" style="margin-bottom:10px;"></div>
+      <div id="events"></div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:8px;">Signals / 理由（rationale_tags）</div>
+      <div class="hint" style="margin-bottom:8px;">資料來源：<code>/api/symbols/{symbol}/signals</code>（僅顯示所選方向）。</div>
+      <div id="signalsTable"></div>
+    </div>
+
+    <script>
+      const STOCK_ID = "{{ stock_id }}";
+      let chart, candleSeries;
+      let ma5Series, ma10Series, ma20Series, ma60Series;
+
+      function getVal(id) { return document.getElementById(id).value; }
+      function setVal(id, v) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.value = v;
+      }
+
+      const LS_KEY = `stock_test2.stock.params.${STOCK_ID}`;
+
+      function loadFromLocalStorage() {
+        try {
+          const raw = localStorage.getItem(LS_KEY);
+          if (!raw) return null;
+          return JSON.parse(raw);
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function saveToLocalStorage(payload) {
+        try {
+          localStorage.setItem(LS_KEY, JSON.stringify(payload));
+        } catch (_) {}
+      }
+
+      function applyQueryDefaults() {
+        const qs = new URLSearchParams(window.location.search);
+        const keys = [
+          "start",
+          "end",
+          "side",
+          "entry_min_score",
+          "exit_no_momentum_days",
+          "use_stop_loss",
+          "initial_capital",
+          "position_sizing",
+          "entry_amount",
+          "entry_pct",
+          "buy_fee_rate",
+          "sell_fee_rate",
+          "sell_tax_rate",
+        ];
+        for (const k of keys) {
+          if (qs.has(k)) {
+            setVal(k, qs.get(k));
+          }
+        }
+      }
+
+      function applySavedParamsIfNoQuery() {
+        const qs = new URLSearchParams(window.location.search);
+        if ([...qs.keys()].length > 0) return; // 有 query 就以 query 為準
+        const saved = loadFromLocalStorage();
+        if (!saved) return;
+        const keys = [
+          "start",
+          "end",
+          "side",
+          "entry_min_score",
+          "exit_no_momentum_days",
+          "use_stop_loss",
+          "initial_capital",
+          "position_sizing",
+          "entry_amount",
+          "entry_pct",
+          "buy_fee_rate",
+          "sell_fee_rate",
+          "sell_tax_rate",
+        ];
+        for (const k of keys) {
+          if (saved[k] !== undefined && saved[k] !== null) {
+            setVal(k, String(saved[k]));
+          }
+        }
+      }
+
+      function initChart() {
+        const el = document.getElementById('chart');
+        el.innerHTML = '';
+        chart = LightweightCharts.createChart(el, {
+          layout: { textColor: '#111827', background: { type: 'solid', color: '#ffffff' } },
+          grid: { vertLines: { color: '#f3f4f6' }, horzLines: { color: '#f3f4f6' } },
+          rightPriceScale: { borderColor: '#e5e7eb' },
+          timeScale: { borderColor: '#e5e7eb' },
+          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        });
+        candleSeries = chart.addCandlestickSeries({
+          upColor: '#10b981', downColor: '#ef4444',
+          borderUpColor: '#10b981', borderDownColor: '#ef4444',
+          wickUpColor: '#10b981', wickDownColor: '#ef4444',
+        });
+
+        ma5Series  = chart.addLineSeries({ color: '#2563eb', lineWidth: 1, title: 'MA5' });
+        ma10Series = chart.addLineSeries({ color: '#7c3aed', lineWidth: 1, title: 'MA10' });
+        ma20Series = chart.addLineSeries({ color: '#111827', lineWidth: 2, title: 'MA20' });
+        ma60Series = chart.addLineSeries({ color: '#f59e0b', lineWidth: 2, title: 'MA60' });
+      }
+
+      function toTime(bd) {
+        // lightweight-charts business day
+        return { year: bd.year, month: bd.month, day: bd.day };
+      }
+
+      async function run() {
+        const btn = document.getElementById('runBtn');
+        btn.disabled = true;
+        try {
+          // persist current params
+          saveToLocalStorage({
+            start: getVal('start'),
+            end: getVal('end'),
+            side: getVal('side'),
+            entry_min_score: getVal('entry_min_score'),
+            exit_no_momentum_days: getVal('exit_no_momentum_days'),
+            use_stop_loss: getVal('use_stop_loss'),
+            initial_capital: getVal('initial_capital'),
+            position_sizing: getVal('position_sizing'),
+            entry_amount: getVal('entry_amount'),
+            entry_pct: getVal('entry_pct'),
+            buy_fee_rate: getVal('buy_fee_rate'),
+            sell_fee_rate: getVal('sell_fee_rate'),
+            sell_tax_rate: getVal('sell_tax_rate'),
+          });
+
+          const qs = new URLSearchParams({
+            stock_id: STOCK_ID,
+            start: getVal('start'),
+            end: getVal('end'),
+            side: getVal('side'),
+            entry_min_score: getVal('entry_min_score'),
+            exit_no_momentum_days: getVal('exit_no_momentum_days'),
+            use_stop_loss: getVal('use_stop_loss'),
+            initial_capital: getVal('initial_capital'),
+            position_sizing: getVal('position_sizing'),
+            entry_amount: getVal('entry_amount'),
+            entry_pct: getVal('entry_pct'),
+            buy_fee_rate: getVal('buy_fee_rate'),
+            sell_fee_rate: getVal('sell_fee_rate'),
+            sell_tax_rate: getVal('sell_tax_rate'),
+          });
+          const resp = await fetch('/api/stock_backtest?' + qs.toString());
+          const json = await resp.json();
+
+          initChart();
+          const candles = json.ohlc.map(r => ({
+            time: toTime(r.time),
+            open: r.open, high: r.high, low: r.low, close: r.close
+          }));
+          candleSeries.setData(candles);
+
+          // MA
+          ma5Series.setData((json.ma?.ma5 || []).map(p => ({ time: toTime(p.time), value: p.value })));
+          ma10Series.setData((json.ma?.ma10 || []).map(p => ({ time: toTime(p.time), value: p.value })));
+          ma20Series.setData((json.ma?.ma20 || []).map(p => ({ time: toTime(p.time), value: p.value })));
+          ma60Series.setData((json.ma?.ma60 || []).map(p => ({ time: toTime(p.time), value: p.value })));
+
+          const markers = json.markers.map(m => ({
+            time: toTime(m.time),
+            position: m.position,
+            color: m.color,
+            shape: m.shape,
+            text: m.text
+          }));
+          candleSeries.setMarkers(markers);
+
+          // summary
+          const s = json.summary || {};
+          const pct = (x) => (Number(x) * 100).toFixed(2) + '%';
+          if (s.trades !== undefined) {
+            document.getElementById('summary').innerHTML = `
+              <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                <div><b>總報酬</b>: ${pct(s.total_ret || 0)}（期末 ${Number(s.equity_end||0).toFixed(0)}）</div>
+                <div><b>勝率</b>: ${pct(s.win_rate || 0)}</div>
+                <div><b>平均單筆</b>: ${pct(s.avg_trade_ret || 0)}</div>
+                <div><b>交易數</b>: ${s.trades}</div>
+                <div><b>部位</b>: ${s.position_sizing === 'percent' ? ('比例 ' + (Number(s.entry_pct||0)*100).toFixed(0) + '%') : ('固定 ' + Number(s.entry_amount||0).toFixed(0))}</div>
+                <div><b>費用</b>: 買 ${((Number(s.buy_fee_rate||0))*100).toFixed(3)}% / 賣 ${((Number(s.sell_fee_rate||0))*100).toFixed(3)}% / 稅 ${((Number(s.sell_tax_rate||0))*100).toFixed(3)}%</div>
+              </div>
+            `;
+          } else {
+            document.getElementById('summary').innerHTML = '';
+          }
+
+          // events table
+          const ev = json.events || [];
+          const html = ev.length
+            ? `<table style="width:100%; border-collapse: collapse;">
+                <thead>
+                  <tr>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">日期</th>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">動作</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">價格</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">股數</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">張數</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">報酬</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">損益</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">資產(後)</th>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">依據</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${ev.map(x => `
+                    <tr>
+                      <td style="padding:6px;">${x.time.year}-${String(x.time.month).padStart(2,'0')}-${String(x.time.day).padStart(2,'0')}</td>
+                      <td style="padding:6px;">${x.action}</td>
+                      <td style="padding:6px; text-align:right;">${Number(x.price).toFixed(2)}</td>
+                      <td style="padding:6px; text-align:right;">${x.shares !== undefined ? Number(x.shares).toFixed(2) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${x.lots !== undefined ? Number(x.lots).toFixed(3) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${x.trade_ret !== undefined ? pct(x.trade_ret) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${x.pnl !== undefined ? Number(x.pnl).toFixed(0) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${x.equity_after !== undefined ? Number(x.equity_after).toFixed(0) : ''}</td>
+                      <td style="padding:6px;">${x.reason}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>`
+            : `<div class="hint">此區間沒有觸發任何進出場。</div>`;
+          document.getElementById('events').innerHTML = html;
+
+          // signals table（用新 API；讓使用者看到每一天為何上榜/為何能進）
+          try {
+            const qs2 = new URLSearchParams({
+              start: getVal('start'),
+              end: getVal('end'),
+              side: getVal('side'),
+            });
+            const resp2 = await fetch(`/api/symbols/${encodeURIComponent(STOCK_ID)}/signals?` + qs2.toString());
+            const js2 = await resp2.json();
+            const rows2 = js2.rows || [];
+            const sHtml = rows2.length ? `
+              <table style="width:100%; border-collapse: collapse;">
+                <thead>
+                  <tr>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">date</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">score</th>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">primary</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">entry_price</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">stop_price</th>
+                    <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">entry_streak</th>
+                    <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">rationale</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows2.map(r => `
+                    <tr>
+                      <td style="padding:6px;">${r.date}</td>
+                      <td style="padding:6px; text-align:right;">${Number(r.score||0)}</td>
+                      <td style="padding:6px;">${r.primary_strategy || ''}</td>
+                      <td style="padding:6px; text-align:right;">${r.entry_price !== null && r.entry_price !== undefined ? Number(r.entry_price).toFixed(2) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${r.stop_price !== null && r.stop_price !== undefined ? Number(r.stop_price).toFixed(2) : ''}</td>
+                      <td style="padding:6px; text-align:right;">${r.entry_streak ?? ''}</td>
+                      <td style="padding:6px;">${(r.rationale_tags||[]).map(t => `<span style="display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; margin-right:6px; font-size:12px;">${t}</span>`).join('')}</td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            ` : `<div class="hint">此區間沒有 signals 資料（可能尚未 build_signals）。</div>`;
+            document.getElementById('signalsTable').innerHTML = sHtml;
+          } catch (e) {
+            document.getElementById('signalsTable').innerHTML = `<div class="hint">signals 查詢失敗：${String(e)}</div>`;
+          }
+
+          chart.timeScale().fitContent();
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      applyQueryDefaults();
+      applySavedParamsIfNoQuery();
+      run();
+    </script>
+  </body>
+</html>
+

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>榜單（Rankings）</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+      label { display: inline-flex; flex-direction: column; gap: 6px; font-size: 14px; }
+      input, select { padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; min-width: 160px; }
+      button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      .card { border: 1px solid #eee; border-radius: 14px; padding: 16px; margin-top: 16px; }
+      .hint { color:#6b7280; font-size:12px; margin-top:6px; }
+      table { width:100%; border-collapse: collapse; }
+      th, td { padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
+      th { text-align: left; color: #374151; }
+      td.num, th.num { text-align: right; }
+      th.sortable { cursor: pointer; user-select: none; }
+      th.sortable:hover { color: #111827; text-decoration: underline; }
+      a { color: #2563eb; text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; margin-right:6px; font-size:12px; }
+      .muted { color:#6b7280; }
+    </style>
+  </head>
+  <body>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>榜單（Rankings）</h2>
+      <div>
+        <a href="/">回測首頁</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label>日期
+          <input id="date" value="{{ default_date }}" />
+        </label>
+        <label>方向
+          <select id="side">
+            <option value="long" selected>做多</option>
+            <option value="short">放空</option>
+          </select>
+        </label>
+        <label>策略（可選）
+          <select id="strategy">
+            <option value="">全部</option>
+            <option value="strat_volume_momentum">策略1：量大動能</option>
+            <option value="strat_trust_breakout">策略2：投信剛買準突破</option>
+            <option value="strat_trust_momentum_buy">策略3：投信動能連買</option>
+            <option value="strat_foreign_big_buy">策略4：外資剛大買</option>
+            <option value="strat_co_buy">策略5：外資投信同買</option>
+            <option value="strat_price_volume_new_high">多方：價量創新高</option>
+            <option value="strat_breakout_edge">多方：突破邊緣</option>
+          </select>
+        </label>
+        <label>筆數
+          <input id="limit" type="number" value="{{ default_limit }}" />
+        </label>
+        <button id="runBtn" onclick="run()">查詢</button>
+      </div>
+      <div class="hint">資料來源：<code>/api/rankings</code>。entry_price=隔日開盤價（T+1 open）。</div>
+    </div>
+
+    <div class="card">
+      <div id="meta" style="margin-bottom:10px;"></div>
+      <div id="table"></div>
+    </div>
+
+    <script>
+      function getVal(id) { return document.getElementById(id).value; }
+      function esc(s) {
+        return String(s ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+      }
+
+      let currentData = null;
+      let sortKey = 'score';
+      let sortDir = 'desc'; // 'asc' | 'desc'
+
+      function openStock(stockId) {
+        // 帶入同一天（方便看單股進出場依據）
+        const d = getVal('date');
+        const side = getVal('side');
+        const qs = new URLSearchParams({
+          start: d,
+          end: d,
+          side: side,
+          entry_min_score: '25',
+          exit_no_momentum_days: '2',
+          use_stop_loss: 'true',
+          initial_capital: '1000000',
+          entry_amount: '100000',
+        });
+        window.open(`/stock/${stockId}?` + qs.toString(), '_blank');
+      }
+
+      function fmtPctFromFraction(x) {
+        if (x === null || x === undefined || x === '') return '';
+        const v = Number(x);
+        if (!Number.isFinite(v)) return '';
+        return (v * 100).toFixed(2) + '%';
+      }
+
+      function fmtPctAlreadyPercent(x) {
+        if (x === null || x === undefined || x === '') return '';
+        const v = Number(x);
+        if (!Number.isFinite(v)) return '';
+        const s = (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+        return s;
+      }
+
+      function fmtNum(x, digits=2) {
+        if (x === null || x === undefined || x === '') return '';
+        const v = Number(x);
+        if (!Number.isFinite(v)) return '';
+        return v.toFixed(digits);
+      }
+
+      function normalizeSortVal(v, type, dir) {
+        // null/undefined 一律排到最後
+        if (v === null || v === undefined) return (dir === 'asc') ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+        if (type === 'num') {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : ((dir === 'asc') ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY);
+        }
+        return String(v);
+      }
+
+      function setSort(key, dir) {
+        if (sortKey === key) {
+          sortDir = (sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          sortKey = key;
+          sortDir = dir || 'desc';
+        }
+        render(currentData);
+      }
+
+      function sortRows(rows, side) {
+        const meta = {
+          symbol: { type: 'str' },
+          name: { type: 'str' },
+          score: { type: 'num' },
+          entry_streak: { type: 'num' },
+          entry_price: { type: 'num' },
+          stop_price: { type: 'num' },
+        };
+        const t = meta[sortKey]?.type || 'str';
+        const dir = sortDir;
+        const mul = (dir === 'asc') ? 1 : -1;
+        return [...rows].sort((a, b) => {
+          const av = normalizeSortVal(a[sortKey], t === 'num' ? 'num' : 'str', dir);
+          const bv = normalizeSortVal(b[sortKey], t === 'num' ? 'num' : 'str', dir);
+          if (av < bv) return -1 * mul;
+          if (av > bv) return  1 * mul;
+          // tie-breaker：score（與 API 一致）
+          const aScore = Number(a.score ?? 0);
+          const bScore = Number(b.score ?? 0);
+          if (aScore !== bScore) return (side === 'long' ? (bScore - aScore) : (aScore - bScore));
+          return String(a.symbol).localeCompare(String(b.symbol));
+        });
+      }
+
+      function sortArrow(key) {
+        if (sortKey !== key) return '';
+        return sortDir === 'asc' ? ' ▲' : ' ▼';
+      }
+
+      function render(data) {
+        currentData = data;
+        const rows = (data && data.rows) ? data.rows : [];
+        document.getElementById('meta').innerHTML =
+          `<div><b>日期</b>: ${esc(data.date)}　<b>方向</b>: ${esc(data.side)}　<b>策略</b>: ${esc(data.strategy || '全部')}　<b>筆數</b>: ${rows.length}</div>`;
+
+        if (!rows.length) {
+          document.getElementById('table').innerHTML = `<div class="hint">沒有符合 entry 的股票（或 signals 尚未產出該日期）。</div>`;
+          return;
+        }
+
+        // 初始排序：依 score（多方高→低、空方低→高）符合直覺
+        if (!sortKey) sortKey = 'score';
+        if (!sortDir) sortDir = (data.side === 'short') ? 'asc' : 'desc';
+
+        const sorted = sortRows(rows, data.side);
+        const html = `
+          <table>
+            <thead>
+              <tr>
+                <th class="sortable" onclick="setSort('symbol')">symbol${sortArrow('symbol')}</th>
+                <th class="sortable" onclick="setSort('name')">name${sortArrow('name')}</th>
+                <th class="num sortable" onclick="setSort('score')">score${sortArrow('score')}</th>
+                <th>primary</th>
+                <th class="num sortable" onclick="setSort('entry_streak')">entry_streak${sortArrow('entry_streak')}</th>
+                <th class="num sortable" onclick="setSort('entry_price')">entry_price${sortArrow('entry_price')}</th>
+                <th class="num sortable" onclick="setSort('stop_price')">stop_price${sortArrow('stop_price')}</th>
+                <th>rationale</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sorted.map(r => `
+                <tr>
+                  <td><a href="/stock/${esc(r.symbol)}" target="_blank">${esc(r.symbol)}</a></td>
+                  <td class="muted">${esc(r.name || '')}</td>
+                  <td class="num">${esc(r.score)}</td>
+                  <td class="muted">${esc(r.primary_strategy || '')}</td>
+                  <td class="num">${esc(r.entry_streak ?? '')}</td>
+                  <td class="num">${esc(fmtNum(r.entry_price, 2))}</td>
+                  <td class="num">${esc(fmtNum(r.stop_price, 2))}</td>
+                  <td>${(r.rationale_tags||[]).map(t => `<span class="pill">${esc(t)}</span>`).join('')}</td>
+                  <td><button onclick="openStock('${esc(r.symbol)}')">看單股</button></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="hint">提示：點欄位標題可排序（再點一次切換升冪/降冪）。entry_streak 以 entry_long/entry_short（及你選的策略）連續成立計算。</div>
+        `;
+        document.getElementById('table').innerHTML = html;
+      }
+
+      async function run() {
+        const btn = document.getElementById('runBtn');
+        btn.disabled = true;
+        try {
+          const qs = new URLSearchParams({
+            date: getVal('date'),
+            side: getVal('side'),
+            limit: getVal('limit'),
+          });
+          const strategy = getVal('strategy');
+          if (strategy) qs.set('strategy', strategy);
+
+          const resp = await fetch('/api/rankings?' + qs.toString());
+          const json = await resp.json();
+          render(json);
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      run();
+    </script>
+  </body>
+</html>
+

@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>動能回測（stock_test2）</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; }
+      label { display: inline-flex; flex-direction: column; gap: 6px; font-size: 14px; }
+      input, select { padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; min-width: 160px; }
+      button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      .card { border: 1px solid #eee; border-radius: 14px; padding: 16px; margin-top: 16px; }
+      pre { background:#0b1020; color:#e5e7eb; padding:12px; border-radius:12px; overflow:auto; }
+    </style>
+  </head>
+  <body>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>動能回測（FastAPI）</h2>
+      <div>
+        <a href="/entries">可進場名單</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label>開始日
+          <input id="start" value="{{ default_start }}" />
+        </label>
+        <label>結束日
+          <input id="end" value="{{ default_end }}" />
+        </label>
+        <label>方向
+          <select id="side">
+            <option value="long" selected>多</option>
+            <option value="short">空</option>
+            <option value="both">多空</option>
+          </select>
+        </label>
+        <label>Top N
+          <input id="top_n" type="number" value="{{ default_top_n }}" />
+        </label>
+        <label>持有天數
+          <input id="holding_days" type="number" value="{{ default_holding_days }}" />
+          <small>設 0 = 不固定持有（用 exit/沒動能/停損 出場）</small>
+        </label>
+        <label>min_abs_score
+          <input id="min_abs_score" type="number" value="{{ default_min_abs_score }}" />
+        </label>
+        <label>entry_min_score
+          <input id="entry_min_score" type="number" value="{{ default_entry_min_score }}" />
+        </label>
+        <label>沒動能連續 N 天出場
+          <input id="exit_no_momentum_days" type="number" value="2" />
+        </label>
+        <label>停損
+          <select id="use_stop_loss">
+            <option value="true" selected>開</option>
+            <option value="false">關</option>
+          </select>
+        </label>
+        <label>用進出場規則
+          <select id="use_entry_exit_signals">
+            <option value="true" selected>開</option>
+            <option value="false">關（純排名持有）</option>
+          </select>
+        </label>
+      </div>
+
+      <div style="margin-top:12px;">
+        <button id="runBtn" onclick="run()">開始回測</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <canvas id="equityChart" height="90"></canvas>
+    </div>
+
+    <div class="card">
+      <div id="summary"></div>
+      <pre id="raw"></pre>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:8px;">個股明細（由回測 trades 彙總）</div>
+      <div class="hint" style="margin-bottom:8px;">點「查看」會另開分頁到單股頁 `/stock/{stock_id}`，並帶入目前的參數。</div>
+      <div id="stockTable"></div>
+    </div>
+
+    <script>
+      let chart;
+      function getVal(id) { return document.getElementById(id).value; }
+      function setVal(id, v) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.value = v;
+      }
+
+      const LS_KEY = "stock_test2.backtest.params";
+
+      function loadFromLocalStorage() {
+        try {
+          const raw = localStorage.getItem(LS_KEY);
+          if (!raw) return null;
+          return JSON.parse(raw);
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function saveToLocalStorage(payload) {
+        try {
+          localStorage.setItem(LS_KEY, JSON.stringify(payload));
+        } catch (_) {}
+      }
+
+      function applySavedParams() {
+        const saved = loadFromLocalStorage();
+        if (!saved) return;
+        const keys = [
+          "start",
+          "end",
+          "side",
+          "top_n",
+          "holding_days",
+          "min_abs_score",
+          "entry_min_score",
+          "exit_no_momentum_days",
+          "use_stop_loss",
+          "use_entry_exit_signals",
+        ];
+        for (const k of keys) {
+          if (saved[k] !== undefined && saved[k] !== null) {
+            setVal(k, String(saved[k]));
+          }
+        }
+      }
+
+      function renderChart(points) {
+        const labels = points.map(p => p.date);
+        const data = points.map(p => p.equity);
+        const ctx = document.getElementById('equityChart').getContext('2d');
+        if (chart) chart.destroy();
+        chart = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{ label: 'Equity', data, borderWidth: 2, pointRadius: 0 }]
+          },
+          options: {
+            responsive: true,
+            scales: { y: { beginAtZero: false } }
+          }
+        });
+      }
+
+      function renderSummary(summary) {
+        const pct = (x) => (x * 100).toFixed(2) + '%';
+        const html = `
+          <div><b>交易數</b>: ${summary.trades}</div>
+          <div><b>勝率</b>: ${pct(summary.win_rate)}</div>
+          <div><b>平均單筆</b>: ${pct(summary.avg_trade_ret)}</div>
+          <div><b>總報酬</b>: ${pct(summary.total_ret)}</div>
+          <div><b>期末淨值</b>: ${summary.equity_end.toFixed(4)}</div>
+          <div><b>最大回撤</b>: ${pct(summary.max_drawdown)}</div>
+        `;
+        document.getElementById('summary').innerHTML = html;
+      }
+
+      function openStock(stockId) {
+        const qs = new URLSearchParams({
+          start: getVal('start'),
+          end: getVal('end'),
+          side: (getVal('side') === 'short' ? 'short' : 'long'),
+          entry_min_score: getVal('entry_min_score'),
+          exit_no_momentum_days: getVal('exit_no_momentum_days'),
+          use_stop_loss: getVal('use_stop_loss'),
+          initial_capital: '1000000',
+          entry_amount: '100000',
+        });
+        window.open(`/stock/${stockId}?` + qs.toString(), '_blank');
+      }
+
+      function renderStockTable(trades) {
+        const map = new Map();
+        for (const t of (trades || [])) {
+          const sid = t.stock_id;
+          if (!map.has(sid)) {
+            map.set(sid, { stock_id: sid, trades: 0, wins: 0, sum: 0 });
+          }
+          const x = map.get(sid);
+          const r = Number(t.ret || 0);
+          x.trades += 1;
+          x.sum += r;
+          if (r > 0) x.wins += 1;
+        }
+        const rows = Array.from(map.values()).map(x => ({
+          stock_id: x.stock_id,
+          trades: x.trades,
+          win_rate: x.trades ? (x.wins / x.trades) : 0,
+          avg_ret: x.trades ? (x.sum / x.trades) : 0,
+          sum_ret: x.sum,
+        })).sort((a,b) => b.sum_ret - a.sum_ret);
+
+        const pct = (v) => (v * 100).toFixed(2) + '%';
+        const html = rows.length ? `
+          <table style="width:100%; border-collapse: collapse;">
+            <thead>
+              <tr>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">stock_id</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">交易數</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">勝率</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">平均單筆</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">累計(單筆相加)</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.slice(0, 300).map(r => `
+                <tr>
+                  <td style="padding:6px;">${r.stock_id}</td>
+                  <td style="padding:6px; text-align:right;">${r.trades}</td>
+                  <td style="padding:6px; text-align:right;">${pct(r.win_rate)}</td>
+                  <td style="padding:6px; text-align:right;">${pct(r.avg_ret)}</td>
+                  <td style="padding:6px; text-align:right;">${pct(r.sum_ret)}</td>
+                  <td style="padding:6px;">
+                    <button onclick="openStock('${r.stock_id}')">查看</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="hint">為避免頁面太重，最多顯示前 300 檔（依累計排序）。</div>
+        ` : `<div class="hint">此回測結果沒有 trades 可顯示（可能 entry 條件過嚴）。</div>`;
+
+        document.getElementById('stockTable').innerHTML = html;
+      }
+
+      async function run() {
+        const btn = document.getElementById('runBtn');
+        btn.disabled = true;
+        try {
+          // persist current params
+          saveToLocalStorage({
+            start: getVal('start'),
+            end: getVal('end'),
+            side: getVal('side'),
+            top_n: getVal('top_n'),
+            holding_days: getVal('holding_days'),
+            min_abs_score: getVal('min_abs_score'),
+            entry_min_score: getVal('entry_min_score'),
+            exit_no_momentum_days: getVal('exit_no_momentum_days'),
+            use_stop_loss: getVal('use_stop_loss'),
+            use_entry_exit_signals: getVal('use_entry_exit_signals'),
+          });
+
+          const qs = new URLSearchParams({
+            start: getVal('start'),
+            end: getVal('end'),
+            side: getVal('side'),
+            top_n: getVal('top_n'),
+            holding_days: getVal('holding_days'),
+            min_abs_score: getVal('min_abs_score'),
+            entry_min_score: getVal('entry_min_score'),
+            exit_no_momentum_days: getVal('exit_no_momentum_days'),
+            use_stop_loss: getVal('use_stop_loss'),
+            use_entry_exit_signals: getVal('use_entry_exit_signals'),
+          });
+          const resp = await fetch('/api/backtest?' + qs.toString());
+          const json = await resp.json();
+          renderChart(json.equity_curve);
+          renderSummary(json.summary);
+          document.getElementById('raw').textContent = JSON.stringify(json.config, null, 2);
+          renderStockTable(json.trades || []);
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      applySavedParams();
+      run();
+    </script>
+  </body>
+</html>
+
