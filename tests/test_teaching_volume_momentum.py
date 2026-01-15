@@ -3,6 +3,9 @@ from datetime import date
 
 
 from etl.build_signals import calc_momentum_score, calc_teaching_strat_volume_momentum
+from configs.strategy_loader import load_strategy_config
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 
 class TestTeachingVolumeMomentum(unittest.TestCase):
@@ -13,7 +16,7 @@ class TestTeachingVolumeMomentum(unittest.TestCase):
         - momentum_score > 7.5
         => strat_volume_momentum = 1
         """
-        flag = calc_teaching_strat_volume_momentum(momentum_score=8.0, yesterday_turnover=600_000_000)
+        flag = calc_teaching_strat_volume_momentum(momentum_score=8.0, yesterday_turnover=600_000_000, strategy_cfg=_STRATEGY_CFG)
         self.assertEqual(int(flag), 1)
 
     def test_prev_trading_day_weekend_gap(self):
@@ -35,7 +38,7 @@ class TestTeachingVolumeMomentum(unittest.TestCase):
         ms = calc_momentum_score(close=None, ma20=10.0, atr14=1.0, is_price_breakout_20d=0)
         self.assertEqual(ms, 0.0)
 
-        flag = calc_teaching_strat_volume_momentum(momentum_score=None, yesterday_turnover=None)
+        flag = calc_teaching_strat_volume_momentum(momentum_score=None, yesterday_turnover=None, strategy_cfg=_STRATEGY_CFG)
         self.assertEqual(int(flag), 0)
 
 

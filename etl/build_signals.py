@@ -18,6 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.db import db_conn
 from configs import settings
+from configs.strategy_loader import load_strategy_config
 
 
 # ============================================================
@@ -147,14 +148,19 @@ def calc_momentum_score(
     return float(score)
 
 
-def calc_teaching_strat_volume_momentum(momentum_score, yesterday_turnover) -> int:
+def calc_teaching_strat_volume_momentum(momentum_score, yesterday_turnover, *, strategy_cfg: Optional[dict] = None) -> int:
     """
     教學版：多方策略｜量大動能（多方）
     上榜條件（同時成立）：
-      1) momentum_score > 7.5
-      2) yesterday_turnover > 500_000_000（昨日成交金額 > 5 億 TWD）
+      1) momentum_score > threshold
+      2) yesterday_turnover > threshold
     缺值視為 0，避免因 None/型別問題炸裂。
     """
+    if strategy_cfg is None:
+        strategy_cfg, _, _ = load_strategy_config({})
+    thresholds = strategy_cfg.get("scoring", {}).get("thresholds", {})
+    momentum_th = float(thresholds.get("momentum_score_high", 0) or 0.0)
+    turnover_th = int(thresholds.get("turnover_min", 0) or 0)
     try:
         ms = float(momentum_score or 0.0)
     except Exception:
@@ -163,7 +169,7 @@ def calc_teaching_strat_volume_momentum(momentum_score, yesterday_turnover) -> i
         yto = int(yesterday_turnover or 0)
     except Exception:
         yto = 0
-    return 1 if (ms > 7.5 and yto > 500_000_000) else 0
+    return 1 if (ms > momentum_th and yto > turnover_th) else 0
 
 
 # ============================================================
@@ -415,7 +421,7 @@ def calc_institution_signals(inst_desc):
 # 5. 分點（簡化集中度）
 # ============================================================
 
-def calc_branch_signals(branch_rows):
+def calc_branch_signals(branch_rows, *, concentration_ratio: float = 0.0):
     """
     你目前的 branch_trading 沒有「主力」標記，因此用集中度做替代：
     - top5_buy_ratio：前五大分點買量集中度
@@ -442,8 +448,8 @@ def calc_branch_signals(branch_rows):
     top5_net_abs = sum(abs(int(r.get("net", 0))) for r in top5_by_net)
     net_ratio = (top5_net_abs / total_net_abs) if total_net_abs > 0 else 0.0
 
-    # 經驗閾值：買量集中度 > 45% 視為偏集中（可日後做成設定）
-    is_concentration = 1 if buy_ratio >= 0.45 else 0
+    # 經驗閾值：買量集中度門檻由 strategy.yaml 控制
+    is_concentration = 1 if buy_ratio >= float(concentration_ratio) else 0
 
     return {
         "branch_top5_buy_ratio": buy_ratio,
@@ -485,10 +491,22 @@ def calc_margin_signals(margin_desc):
 # 7. 策略（步驟2）與總分
 # ============================================================
 
-def calc_strategies_and_score(market_regime, sig):
+def calc_strategies_and_score(market_regime, sig, strategy_cfg: dict):
     """
     以講義「策略上榜」的概念，將條件拆成明確策略旗標，再由旗標與基礎條件給分。
+    所有門檻/係數均由 strategy_cfg 提供。
     """
+    scoring = strategy_cfg.get("scoring", {}) if isinstance(strategy_cfg, dict) else {}
+    points = scoring.get("points", {})
+    strat_points = scoring.get("strategy_points", {})
+    thresholds = scoring.get("thresholds", {})
+    regime_weights = scoring.get("regime_weights", {})
+    allowed_regimes_long = scoring.get("allowed_regimes_long", ["bull", "range"])
+    allowed_regimes_short = scoring.get("allowed_regimes_short", ["bear", "range"])
+    entry_min_score_long = int(scoring.get("entry_min_score_long", 0) or 0)
+    entry_min_score_short = int(scoring.get("entry_min_score_short", 0) or 0)
+    entry_min_score_range_boost = int(scoring.get("entry_min_score_range_boost", 0) or 0)
+
     detail_long = {}
     detail_short = {}
     score_long = 0
@@ -501,96 +519,116 @@ def calc_strategies_and_score(market_regime, sig):
 
     # --------- 技術面（步驟3）---------
     if sig.get("above_ma20"):
-        score_long += 5
-        detail_long["above_ma20"] = 5
+        w = int(points.get("above_ma20", 0) or 0)
+        score_long += w
+        detail_long["above_ma20"] = w
         rationale.add("above_ma20")
     if sig.get("above_ma60"):
-        score_long += 5
-        detail_long["above_ma60"] = 5
+        w = int(points.get("above_ma60", 0) or 0)
+        score_long += w
+        detail_long["above_ma60"] = w
         rationale.add("above_ma60")
     if sig.get("is_price_breakout_20d"):
-        score_long += 15
-        detail_long["breakout_20d"] = 15
+        w = int(points.get("breakout_20d", 0) or 0)
+        score_long += w
+        detail_long["breakout_20d"] = w
         rationale.add("breakout_20d")
     if sig.get("is_volume_breakout_20d"):
-        score_long += 10
-        detail_long["volume_breakout_20d"] = 10
+        w = int(points.get("volume_breakout_20d_long", 0) or 0)
+        score_long += w
+        detail_long["volume_breakout_20d"] = w
         rationale.add("volume_breakout_20d")
 
     # 空方技術面（分開計分，不用負分混在同一 score）
     below_ma20 = (close is not None and ma20 is not None and close < ma20)
     below_ma60 = (close is not None and ma60 is not None and close < ma60)
     if below_ma20:
-        score_short += 5
-        detail_short["below_ma20"] = 5
+        w = int(points.get("below_ma20", 0) or 0)
+        score_short += w
+        detail_short["below_ma20"] = w
         rationale.add("below_ma20")
     if below_ma60:
-        score_short += 5
-        detail_short["below_ma60"] = 5
+        w = int(points.get("below_ma60", 0) or 0)
+        score_short += w
+        detail_short["below_ma60"] = w
         rationale.add("below_ma60")
     if sig.get("is_price_breakdown_20d"):
-        score_short += 15
-        detail_short["breakdown_20d"] = 15
+        w = int(points.get("breakdown_20d", 0) or 0)
+        score_short += w
+        detail_short["breakdown_20d"] = w
         rationale.add("breakdown_20d")
     if sig.get("is_volume_breakout_20d"):
         # 下跌段爆量常見，空方也給分（與多方不同權重）
-        score_short += 8
-        detail_short["volume_breakout_20d"] = 8
+        w = int(points.get("volume_breakout_20d_short", 0) or 0)
+        score_short += w
+        detail_short["volume_breakout_20d"] = w
 
     # --------- 籌碼面：法人（步驟4）---------
     if sig.get("is_foreign_first_buy"):
-        score_long += 8
-        detail_long["foreign_buy_day1"] = 8
+        w = int(points.get("foreign_first_buy", 0) or 0)
+        score_long += w
+        detail_long["foreign_buy_day1"] = w
         rationale.add("foreign_buy_day1")
     if sig.get("is_trust_first_buy"):
-        score_long += 10
-        detail_long["trust_buy_day1"] = 10
+        w = int(points.get("trust_first_buy", 0) or 0)
+        score_long += w
+        detail_long["trust_buy_day1"] = w
         rationale.add("trust_buy_day1")
     if sig.get("is_foreign_buy_3d"):
-        score_long += 8
-        detail_long["foreign_buy_3d"] = 8
+        w = int(points.get("foreign_buy_3d", 0) or 0)
+        score_long += w
+        detail_long["foreign_buy_3d"] = w
         rationale.add("foreign_buy_3d")
     if sig.get("is_trust_buy_5d"):
-        score_long += 10
-        detail_long["trust_buy_5d"] = 10
+        w = int(points.get("trust_buy_5d", 0) or 0)
+        score_long += w
+        detail_long["trust_buy_5d"] = w
         rationale.add("trust_buy_5d")
     if sig.get("is_co_buy"):
-        score_long += 15
-        detail_long["co_buy_today"] = 15
+        w = int(points.get("co_buy", 0) or 0)
+        score_long += w
+        detail_long["co_buy_today"] = w
         rationale.add("co_buy_today")
 
     if sig.get("is_foreign_first_sell"):
-        score_short += 8
-        detail_short["foreign_sell_day1"] = 8
+        w = int(points.get("foreign_first_sell", 0) or 0)
+        score_short += w
+        detail_short["foreign_sell_day1"] = w
         rationale.add("foreign_sell_day1")
     if sig.get("is_trust_first_sell"):
-        score_short += 10
-        detail_short["trust_sell_day1"] = 10
+        w = int(points.get("trust_first_sell", 0) or 0)
+        score_short += w
+        detail_short["trust_sell_day1"] = w
         rationale.add("trust_sell_day1")
     if sig.get("is_foreign_sell_3d"):
-        score_short += 8
-        detail_short["foreign_sell_3d"] = 8
+        w = int(points.get("foreign_sell_3d", 0) or 0)
+        score_short += w
+        detail_short["foreign_sell_3d"] = w
         rationale.add("foreign_sell_3d")
     if sig.get("is_trust_sell_5d"):
-        score_short += 10
-        detail_short["trust_sell_5d"] = 10
+        w = int(points.get("trust_sell_5d", 0) or 0)
+        score_short += w
+        detail_short["trust_sell_5d"] = w
         rationale.add("trust_sell_5d")
     if sig.get("is_co_sell"):
-        score_short += 15
-        detail_short["co_sell_today"] = 15
+        w = int(points.get("co_sell", 0) or 0)
+        score_short += w
+        detail_short["co_sell_today"] = w
         rationale.add("co_sell_today")
 
     # --------- 分點集中度（偏輔助）---------
     if sig.get("is_branch_concentration"):
-        score_long += 5
-        detail_long["branch_concentration"] = 5
+        w = int(points.get("branch_concentration", 0) or 0)
+        score_long += w
+        detail_long["branch_concentration"] = w
         rationale.add("branch_concentration")
 
     # --------- 融資風險（步驟5前的風險提示）---------
     # 先做保守版：只扣多方（避免把放空也一起削弱）
     if sig.get("is_margin_risk"):
-        score_long -= 10
-        detail_long["margin_risk"] = -10
+        w = int(points.get("margin_risk_penalty", 0) or 0)
+        score_long += w
+        detail_long["margin_risk"] = w
         rationale.add("margin_risk")
 
     # --------- 策略旗標（步驟2）---------
@@ -603,14 +641,20 @@ def calc_strategies_and_score(market_regime, sig):
     except Exception:
         t3 = 0
 
-    strat_volume_momentum = calc_teaching_strat_volume_momentum(sig.get("momentum_score"), sig.get("yesterday_turnover"))
+    turnover_min = thresholds.get("turnover_min", 0) or 0
+    momentum_score_high = float(thresholds.get("momentum_score_high", 0) or 0.0)
+    momentum_score_medium = float(thresholds.get("momentum_score_medium", 0) or 0.0)
+    trust_buy_streak_min = int(thresholds.get("trust_buy_streak_min", 0) or 0)
+    foreign_net_min_co_buy = int(thresholds.get("foreign_net_min_co_buy", 0) or 0)
+
+    strat_volume_momentum = 1 if (float(sig.get("momentum_score") or 0.0) > momentum_score_high and yto > turnover_min) else 0
     strat_price_volume_new_high = 1 if (
         int(sig.get("is_price_breakout_400d", 0) or 0) == 1 and
-        yto > 500_000_000 and
+        yto > turnover_min and
         int(sig.get("is_volume_breakout_10d", 0) or 0) == 1
     ) else 0
-    strat_breakout_edge = 1 if (int(sig.get("is_near_40d_high", 0) or 0) == 1 and yto > 500_000_000) else 0
-    strat_trust_breakout = 1 if (int(sig.get("is_near_40d_high", 0) or 0) == 1 and yto > 500_000_000 and t3 > 0) else 0
+    strat_breakout_edge = 1 if (int(sig.get("is_near_40d_high", 0) or 0) == 1 and yto > turnover_min) else 0
+    strat_trust_breakout = 1 if (int(sig.get("is_near_40d_high", 0) or 0) == 1 and yto > turnover_min and t3 > 0) else 0
     # 策略3（PDF）：投信動能連買（維持既有測試/定義）
     # 條件：動能>7.5 + 昨日成交金額>5e8 + 投信連買>=2
     try:
@@ -621,11 +665,11 @@ def calc_strategies_and_score(market_regime, sig):
         trust_buy_streak = int(sig.get("trust_buy_streak") or 0)
     except Exception:
         trust_buy_streak = 0
-    strat_trust_momentum_buy = 1 if (ms > 7.5 and yto > 500_000_000 and trust_buy_streak >= 2) else 0
+    strat_trust_momentum_buy = 1 if (ms > momentum_score_high and yto > turnover_min and trust_buy_streak >= trust_buy_streak_min) else 0
 
     # 策略4（PDF）：外資剛大買（維持既有測試/定義）
     # 條件：動能>7.5 + 昨日成交金額>5e8 + 外資剛買第一天
-    strat_foreign_big_buy = 1 if (ms > 7.5 and yto > 500_000_000 and int(sig.get("is_foreign_first_buy", 0) or 0) == 1) else 0
+    strat_foreign_big_buy = 1 if (ms > momentum_score_high and yto > turnover_min and int(sig.get("is_foreign_first_buy", 0) or 0) == 1) else 0
 
     # 策略5（PDF）：外資投信同買（維持既有測試/定義）
     # 條件：動能>6 + 昨日成交金額>5e8 + 土洋同買 + 外資買超>5千萬
@@ -633,7 +677,7 @@ def calc_strategies_and_score(market_regime, sig):
         foreign_net = int(sig.get("foreign_net") or 0)
     except Exception:
         foreign_net = 0
-    strat_co_buy = 1 if (ms > 6.0 and yto > 500_000_000 and int(sig.get("is_co_buy", 0) or 0) == 1 and foreign_net > 50_000_000) else 0
+    strat_co_buy = 1 if (ms > momentum_score_medium and yto > turnover_min and int(sig.get("is_co_buy", 0) or 0) == 1 and foreign_net > foreign_net_min_co_buy) else 0
 
     strat_volume_momentum_weak = 1 if (int(sig.get("is_volume_breakout_20d", 0) or 0) == 1 and int(sig.get("above_ma20", 0) or 0) == 0) else 0
     strat_price_volume_new_low = 1 if (int(sig.get("is_price_breakdown_20d", 0) or 0) == 1 and int(sig.get("is_volume_breakout_20d", 0) or 0) == 1) else 0
@@ -644,49 +688,54 @@ def calc_strategies_and_score(market_regime, sig):
 
     # 策略分數（可解釋加分）
     if strat_volume_momentum:
-        score_long += 12; detail_long["strat_volume_momentum"] = 12; rationale.add("volume_momentum")
+        w = int(strat_points.get("strat_volume_momentum", 0) or 0)
+        score_long += w; detail_long["strat_volume_momentum"] = w; rationale.add("volume_momentum")
     if strat_price_volume_new_high:
-        score_long += 12; detail_long["strat_price_volume_new_high"] = 12; rationale.add("price_volume_new_high")
+        w = int(strat_points.get("strat_price_volume_new_high", 0) or 0)
+        score_long += w; detail_long["strat_price_volume_new_high"] = w; rationale.add("price_volume_new_high")
     if strat_breakout_edge:
-        score_long += 8; detail_long["strat_breakout_edge"] = 8; rationale.add("breakout_edge")
+        w = int(strat_points.get("strat_breakout_edge", 0) or 0)
+        score_long += w; detail_long["strat_breakout_edge"] = w; rationale.add("breakout_edge")
     if strat_trust_breakout:
-        score_long += 10; detail_long["strat_trust_breakout"] = 10; rationale.add("trust_breakout")
+        w = int(strat_points.get("strat_trust_breakout", 0) or 0)
+        score_long += w; detail_long["strat_trust_breakout"] = w; rationale.add("trust_breakout")
     if strat_trust_momentum_buy:
-        score_long += 8; detail_long["strat_trust_momentum_buy"] = 8; rationale.add("trust_momentum_buy")
+        w = int(strat_points.get("strat_trust_momentum_buy", 0) or 0)
+        score_long += w; detail_long["strat_trust_momentum_buy"] = w; rationale.add("trust_momentum_buy")
     if strat_foreign_big_buy:
-        score_long += 8; detail_long["strat_foreign_big_buy"] = 8; rationale.add("foreign_big_buy")
+        w = int(strat_points.get("strat_foreign_big_buy", 0) or 0)
+        score_long += w; detail_long["strat_foreign_big_buy"] = w; rationale.add("foreign_big_buy")
     if strat_co_buy:
-        score_long += 10; detail_long["strat_co_buy"] = 10; rationale.add("co_buy")
+        w = int(strat_points.get("strat_co_buy", 0) or 0)
+        score_long += w; detail_long["strat_co_buy"] = w; rationale.add("co_buy")
 
     if strat_volume_momentum_weak:
-        score_short += 8; detail_short["strat_volume_momentum_weak"] = 8; rationale.add("volume_momentum_weak")
+        w = int(strat_points.get("strat_volume_momentum_weak", 0) or 0)
+        score_short += w; detail_short["strat_volume_momentum_weak"] = w; rationale.add("volume_momentum_weak")
     if strat_price_volume_new_low:
-        score_short += 12; detail_short["strat_price_volume_new_low"] = 12; rationale.add("price_volume_new_low")
+        w = int(strat_points.get("strat_price_volume_new_low", 0) or 0)
+        score_short += w; detail_short["strat_price_volume_new_low"] = w; rationale.add("price_volume_new_low")
     if strat_trust_breakdown:
-        score_short += 10; detail_short["strat_trust_breakdown"] = 10; rationale.add("trust_breakdown")
+        w = int(strat_points.get("strat_trust_breakdown", 0) or 0)
+        score_short += w; detail_short["strat_trust_breakdown"] = w; rationale.add("trust_breakdown")
     if strat_trust_momentum_sell:
-        score_short += 8; detail_short["strat_trust_momentum_sell"] = 8; rationale.add("trust_momentum_sell")
+        w = int(strat_points.get("strat_trust_momentum_sell", 0) or 0)
+        score_short += w; detail_short["strat_trust_momentum_sell"] = w; rationale.add("trust_momentum_sell")
     if strat_foreign_big_sell:
-        score_short += 8; detail_short["strat_foreign_big_sell"] = 8; rationale.add("foreign_big_sell")
+        w = int(strat_points.get("strat_foreign_big_sell", 0) or 0)
+        score_short += w; detail_short["strat_foreign_big_sell"] = w; rationale.add("foreign_big_sell")
     if strat_co_sell:
-        score_short += 10; detail_short["strat_co_sell"] = 10; rationale.add("co_sell")
+        w = int(strat_points.get("strat_co_sell", 0) or 0)
+        score_short += w; detail_short["strat_co_sell"] = w; rationale.add("co_sell")
 
     # 市場狀態權重（分 side）
-    if market_regime == "bull":
-        score_long = int(score_long * 1.10)
-        score_short = int(score_short * 0.80)
-        detail_long["regime_boost"] = "bull_x1.10"
-        detail_short["regime_penalty"] = "bull_x0.80"
-    elif market_regime == "bear":
-        score_long = int(score_long * 0.80)
-        score_short = int(score_short * 1.10)
-        detail_long["regime_penalty"] = "bear_x0.80"
-        detail_short["regime_boost"] = "bear_x1.10"
-    elif market_regime == "range":
-        score_long = int(score_long * 0.90)
-        score_short = int(score_short * 0.90)
-        detail_long["regime_range"] = "range_x0.90"
-        detail_short["regime_range"] = "range_x0.90"
+    if market_regime in regime_weights:
+        w_long = float(regime_weights.get(market_regime, {}).get("long", 1.0))
+        w_short = float(regime_weights.get(market_regime, {}).get("short", 1.0))
+        score_long = int(score_long * w_long)
+        score_short = int(score_short * w_short)
+        detail_long["regime_weight"] = f"{market_regime}_x{w_long:.2f}"
+        detail_short["regime_weight"] = f"{market_regime}_x{w_short:.2f}"
 
     # --------- 步驟5：停損點（用 ATR 與 20日前高/前低）---------
     stop_side = None
@@ -744,13 +793,12 @@ def calc_strategies_and_score(market_regime, sig):
     # 進出場規則（依動能教學 5 步驟可落地版本）
     # ============================================================
     # 步驟1：天氣圖閘門
-    allow_long = market_regime in ("bull", "range")
-    allow_short = market_regime in ("bear", "range")
+    allow_long = market_regime in allowed_regimes_long
+    allow_short = market_regime in allowed_regimes_short
 
-    base_min_score = getattr(settings, "SIGNALS_ENTRY_MIN_SCORE", 25)
     # range：保守一點，提高門檻
-    min_long = int(base_min_score) + (5 if market_regime == "range" else 0)
-    min_short = int(base_min_score) + (5 if market_regime == "range" else 0)
+    min_long = int(entry_min_score_long) + (entry_min_score_range_boost if market_regime == "range" else 0)
+    min_short = int(entry_min_score_short) + (entry_min_score_range_boost if market_regime == "range" else 0)
 
     long_strats = [
         ("volume_momentum", sig["strat_volume_momentum"]),
@@ -813,14 +861,14 @@ def calc_strategies_and_score(market_regime, sig):
 # 8. 主流程：合併所有表 → 寫入 stock_signals_v2 + 印榜單
 # ============================================================
 
-def build_signals_for_date(target_date):
+def build_signals_for_date(target_date, *, strategy_cfg: dict, config_hash: str, config_snapshot: str):
     signals_rows = []
     with db_conn(commit_on_success=True) as conn:
         require_signals_table(conn)
         cursor = conn.cursor()
         cols = _get_table_columns(conn, "stock_signals_v2")
 
-        lookback_days = getattr(settings, "SIGNALS_LOOKBACK_DAYS", 120)
+        lookback_days = int(strategy_cfg.get("signals", {}).get("lookback_days", getattr(settings, "SIGNALS_LOOKBACK_DAYS", 120)))
         lookback_start = target_date - timedelta(days=lookback_days)
 
         # 讀取日K（一次抓足夠的回溯，避免每檔股票 N+1 query）
@@ -883,8 +931,8 @@ def build_signals_for_date(target_date):
             branch_by_stock.setdefault(r["stock_id"], []).append(r)
 
         # 取得大盤 proxy（預設 0050，可在 settings.MARKET_PROXY_STOCK_ID 調整）
-        proxy_id = getattr(settings, "MARKET_PROXY_STOCK_ID", "0050")
-        proxy_lookback_days = getattr(settings, "SIGNALS_PROXY_LOOKBACK_DAYS", 260)
+        proxy_id = strategy_cfg.get("signals", {}).get("market_proxy_stock_id", getattr(settings, "MARKET_PROXY_STOCK_ID", "0050"))
+        proxy_lookback_days = int(strategy_cfg.get("signals", {}).get("proxy_lookback_days", getattr(settings, "SIGNALS_PROXY_LOOKBACK_DAYS", 260)))
         proxy_start = target_date - timedelta(days=proxy_lookback_days)
         cursor.execute(
             """
@@ -913,7 +961,8 @@ def build_signals_for_date(target_date):
             sig.update(calc_kbar_signals(daily_desc[:450]))
             sig.update(calc_institution_signals(inst_by_stock.get(stock_id, [])[:10]))
             sig.update(calc_margin_signals(margin_by_stock.get(stock_id, [])[:10]))
-            sig.update(calc_branch_signals(branch_by_stock.get(stock_id, [])))
+            branch_ratio = float(strategy_cfg.get("scoring", {}).get("thresholds", {}).get("branch_concentration_ratio", 0.0) or 0.0)
+            sig.update(calc_branch_signals(branch_by_stock.get(stock_id, []), concentration_ratio=branch_ratio))
 
             # turnover / yesterday_turnover（以「上一筆 trading_date」當作前一交易日，天然處理週末/連假）
             today_row = rows_asc[-1]  # target_date
@@ -929,7 +978,10 @@ def build_signals_for_date(target_date):
                 is_price_breakout_20d=int(sig.get("is_price_breakout_20d", 0) or 0),
             )
 
-            sig = calc_strategies_and_score(market_regime, sig)
+            sig = calc_strategies_and_score(market_regime, sig, strategy_cfg)
+            sig["config_hash"] = config_hash
+            sig["config_snapshot"] = config_snapshot
+            sig["signal_version"] = strategy_cfg.get("signals", {}).get("signal_version", "v2")
 
             # JSON 欄位：pymysql 需轉成 str（DB 沒該欄位也不影響 insert，因為我們會動態決定欄位清單）
             if isinstance(sig.get("score_detail"), (dict, list)):
@@ -964,7 +1016,16 @@ def build_signals_for_date(target_date):
                 "stop_loss_side", "stop_loss_price", "stop_loss_pct",
                 "primary_strategy", "entry_long", "exit_long", "entry_short", "exit_short",
             ]
-            optional_cols = ["score_long", "score_short", "score_detail_long", "score_detail_short", "rationale_tags"]
+            optional_cols = [
+                "score_long",
+                "score_short",
+                "score_detail_long",
+                "score_detail_short",
+                "rationale_tags",
+                "config_hash",
+                "config_snapshot",
+                "signal_version",
+            ]
             cols_to_write = [c for c in base_cols if c in cols] + [c for c in optional_cols if c in cols]
             cols_sql = ", ".join(cols_to_write)
             vals_sql = ", ".join([f"%({c})s" for c in cols_to_write])
@@ -974,7 +1035,7 @@ def build_signals_for_date(target_date):
         cursor.close()
 
     # 印出榜單（不依賴 DB）
-    top_n = getattr(settings, "SIGNALS_TOP_N", 30)
+    top_n = int(strategy_cfg.get("signals", {}).get("top_n", getattr(settings, "SIGNALS_TOP_N", 30)))
     longs = sorted(signals_rows, key=lambda x: int(x.get("score_long", 0) or 0), reverse=True)[:top_n]
     shorts = sorted(signals_rows, key=lambda x: int(x.get("score_short", 0) or 0), reverse=True)[:top_n]
 
@@ -1007,18 +1068,29 @@ if __name__ == "__main__":
     # - python etl/build_signals.py                  （自動挑最新完整交易日）
     # - python etl/build_signals.py YYYY-MM-DD       （單日）
     # - python etl/build_signals.py START END        （區間，含 start/end）
+    args = list(sys.argv[1:])
+    overrides = None
+    if "--override" in args:
+        idx = args.index("--override")
+        if idx + 1 < len(args):
+            try:
+                overrides = json.loads(args[idx + 1])
+            except Exception as e:
+                raise RuntimeError(f"無法解析 --override JSON：{e}")
+            del args[idx: idx + 2]
     arg_date = None
     arg_range = None
-    if len(sys.argv) >= 2:
-        if len(sys.argv) >= 3:
-            arg_range = (datetime.strptime(sys.argv[1], "%Y-%m-%d").date(), datetime.strptime(sys.argv[2], "%Y-%m-%d").date())
-        else:
-            arg_date = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
+    if len(args) >= 2:
+        arg_range = (datetime.strptime(args[0], "%Y-%m-%d").date(), datetime.strptime(args[1], "%Y-%m-%d").date())
+    elif len(args) == 1:
+        arg_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+
+    strategy_cfg, config_hash, config_snapshot = load_strategy_config(overrides)
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             # 若未指定日期，挑「最新且資料量足夠」的交易日（避免像 2025-12-12 只有 263 檔的半套資料）
-            min_stocks = getattr(settings, "SIGNALS_MIN_STOCKS", 2000)
+            min_stocks = int(strategy_cfg.get("signals", {}).get("min_stocks", getattr(settings, "SIGNALS_MIN_STOCKS", 2000)))
             if arg_date is None:
                 cur.execute(
                     """
@@ -1057,6 +1129,6 @@ if __name__ == "__main__":
                 days = [r["trading_date"] for r in cur.fetchall()]
 
         for d in days:
-            build_signals_for_date(d)
+            build_signals_for_date(d, strategy_cfg=strategy_cfg, config_hash=config_hash, config_snapshot=config_snapshot)
     else:
-        build_signals_for_date(arg_date)
+        build_signals_for_date(arg_date, strategy_cfg=strategy_cfg, config_hash=config_hash, config_snapshot=config_snapshot)

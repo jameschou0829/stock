@@ -59,9 +59,6 @@ def has_recent_trading(stock_id: str, days: int = 30) -> bool:
             return row["last_date"] >= (date.today() - timedelta(days=days))
 
 def save_stock_info(items):
-    with db_conn(commit_on_success=True) as conn:
-        cursor = conn.cursor()
-
     sql = """
     INSERT INTO stock_info
       (stock_id, stock_name, industry, type, ipo_date, is_active)
@@ -85,8 +82,12 @@ def save_stock_info(items):
             is_active_stock(r)
         ))
 
-        cursor.executemany(sql, rows)
-        cursor.close()
+    if not rows:
+        return
+
+    with db_conn(commit_on_success=True) as conn:
+        with conn.cursor() as cursor:
+            cursor.executemany(sql, rows)
 
 
 def run_stock_info():

@@ -1,0 +1,125 @@
+signals:
+  market_proxy_stock_id: "0050"
+  lookback_days: 520
+  proxy_lookback_days: 260
+  min_stocks: 2000
+  top_n: 30
+  signal_version: "v2"
+
+scoring:
+  entry_min_score_long: 25
+  entry_min_score_short: 25
+  entry_min_score_range_boost: 5
+  allowed_regimes_long: ["bull", "range"]
+  allowed_regimes_short: ["bear", "range"]
+  regime_weights:
+    bull:  { long: 1.15, short: 0.85 }
+    range: { long: 1.00, short: 1.00 }
+    bear:  { long: 0.85, short: 1.15 }
+  points:
+    above_ma20: 5
+    above_ma60: 5
+    breakout_20d: 15
+    volume_breakout_20d_long: 10
+    below_ma20: 5
+    below_ma60: 5
+    breakdown_20d: 15
+    volume_breakout_20d_short: 8
+    foreign_first_buy: 8
+    trust_first_buy: 10
+    foreign_buy_3d: 8
+    trust_buy_5d: 10
+    co_buy: 15
+    foreign_first_sell: 8
+    trust_first_sell: 10
+    foreign_sell_3d: 8
+    trust_sell_5d: 10
+    co_sell: 15
+    branch_concentration: 5
+    margin_risk_penalty: -10
+  strategy_points:
+    strat_volume_momentum: 12
+    strat_price_volume_new_high: 12
+    strat_breakout_edge: 8
+    strat_trust_breakout: 10
+    strat_trust_momentum_buy: 8
+    strat_foreign_big_buy: 8
+    strat_co_buy: 10
+    strat_volume_momentum_weak: 8
+    strat_price_volume_new_low: 12
+    strat_trust_breakdown: 10
+    strat_trust_momentum_sell: 8
+    strat_foreign_big_sell: 8
+    strat_co_sell: 10
+  thresholds:
+    turnover_min: 500000000
+    momentum_score_high: 7.5
+    momentum_score_medium: 6.0
+    trust_buy_streak_min: 2
+    foreign_net_min_co_buy: 50000000
+    branch_concentration_ratio: 0.45
+
+costs:
+  commission_bps: 14.25
+  tax_bps: 30.0
+  slippage_bps: 5.0
+
+portfolio:
+  initial_capital: 1000000
+  tranches: 10
+  max_positions: 5
+  equity_stop_pct: 0.30
+
+risk:
+  stop_loss_pct: 0.10
+
+kpi:
+  horizon_days: 5
+  target_return: 0.02
+  price_source: "high"        # high/close
+  trigger_mode: "touch"       # touch/end
+  fail_action: "watchlist"    # watchlist/exit
+  grace_days: 0
+  require_profit_days: 0
+
+rotation:
+  allow_daily_rotation: true
+  delta_edge: 0.03
+  rotation_requires_fail: true
+  edge_source: "score"        # score/p_kpi
+
+backtest:
+  use_stop_loss: true
+  use_entry_exit_signals: true
+  exit_no_momentum_days: 2
+  min_abs_score: 0
+  holding_days: 0
+  entry_timing: "next_open"   # next_open / close
+
+probability:
+  enabled: true
+  min_prob_gte: null   # 例如 0.60；null 代表不過濾
+  label:
+    mode: "kpi_touch"         # kpi_touch / close_positive
+    horizon_days: 5
+    target_return: 0.02
+    price_source: "high"      # high/close
+  prob_field: "prob_kpi_5d_2pct_touch"
+  features:
+    - score_long
+    - score_short
+    - momentum_score
+    - turnover
+    - yesterday_turnover
+    - is_price_breakout_20d
+    - is_volume_breakout_20d
+    - is_price_breakdown_20d
+    - foreign_net
+    - trust_net
+    - trust_net_3d
+    - is_foreign_first_buy
+    - is_trust_first_buy
+    - is_co_buy
+    - is_foreign_first_sell
+    - is_trust_first_sell
+    - is_co_sell

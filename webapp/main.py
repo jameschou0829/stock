@@ -1,12 +1,14 @@
 import os
 import sys
-from datetime import date
+import json
+from datetime import date, datetime
 from typing import Optional
+from uuid import uuid4
 
 import csv
 import io
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -14,13 +16,17 @@ from starlette.requests import Request
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backtest.engine import BacktestConfig, run_backtest, parse_date
+from backtest.engine import build_backtest_config, run_backtest, parse_date
+from backtest.selection import select_candidates
+from configs.strategy_loader import load_strategy_config
 from configs import settings
 from utils.db import db_conn
 from backtest.engine import has_momentum
 
 
 app = FastAPI(title="stock_test2 backtest")
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -37,7 +43,7 @@ def index(request: Request):
             "default_top_n": 20,
             "default_holding_days": 5,
             "default_min_abs_score": 10,
-            "default_entry_min_score": getattr(settings, "SIGNALS_ENTRY_MIN_SCORE", 25),
+            "default_entry_min_score": int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)),
         },
     )
 
@@ -51,7 +57,7 @@ def stock_page(stock_id: str, request: Request):
             "stock_id": stock_id,
             "default_start": "2025-09-11",
             "default_end": "2026-01-09",
-            "default_entry_min_score": getattr(settings, "SIGNALS_ENTRY_MIN_SCORE", 25),
+            "default_entry_min_score": int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)),
         },
     )
 
@@ -167,6 +173,19 @@ def _fmt_rationale_tags(sig: dict, side: str) -> list[str]:
     return tags
 
 
+def _parse_rationale_tags(raw, sig: dict, side: str) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return _fmt_rationale_tags(sig, side)
+
+
 def _get_stock_names(conn, stock_ids: list[str]) -> dict[str, str]:
     if not stock_ids:
         return {}
@@ -218,6 +237,107 @@ def _get_next_open_prices(conn, stock_ids: list[str], d: date) -> dict[str, floa
         except Exception:
             continue
     return out
+
+
+def _persist_backtest_run(run_id: str, cfg, result: dict) -> None:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    trades = result.get("trades") or []
+    equity_curve = result.get("equity_curve") or []
+    with db_conn(commit_on_success=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO backtest_runs
+                  (run_id, start_date, end_date, side, config_hash, config_snapshot, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    run_id,
+                    parse_date(result["config"]["start"]),
+                    parse_date(result["config"]["end"]),
+                    result["config"]["side"],
+                    cfg.config_hash,
+                    cfg.config_snapshot,
+                    now,
+                ),
+            )
+
+            if trades:
+                base_cols = [
+                    "run_id",
+                    "stock_id",
+                    "side",
+                    "signal_date",
+                    "entry_exec_date",
+                    "entry_timing",
+                    "entry_price",
+                    "entry_score",
+                    "entry_primary_strategy",
+                    "entry_rationale_tags",
+                    "entry_prob",
+                    "exit_date",
+                    "exit_price",
+                    "ret_gross",
+                    "ret_net",
+                    "cost_paid",
+                    "exit_reason",
+                    "kpi_passed",
+                ]
+                rows = []
+                for t in trades:
+                    rows.append(
+                        (
+                            run_id,
+                            t.get("stock_id"),
+                            t.get("side"),
+                            parse_date(t.get("signal_date")),
+                            parse_date(t.get("entry_exec_date")),
+                            t.get("entry_timing"),
+                            t.get("entry_price"),
+                            t.get("entry_score"),
+                            t.get("entry_primary_strategy"),
+                            json.dumps(t.get("entry_rationale_tags"), ensure_ascii=False),
+                            t.get("entry_prob"),
+                            parse_date(t.get("exit_date")),
+                            t.get("exit_price"),
+                            t.get("ret_gross"),
+                            t.get("ret_net"),
+                            t.get("cost_paid"),
+                            t.get("exit_reason"),
+                            1 if t.get("kpi_passed") else 0,
+                        )
+                    )
+                cols_sql = ", ".join(base_cols)
+                vals_sql = ", ".join(["%s"] * len(base_cols))
+                cur.executemany(
+                    f"""
+                    INSERT INTO backtest_trades ({cols_sql})
+                    VALUES ({vals_sql})
+                    """,
+                    rows,
+                )
+
+            if equity_curve:
+                rows = []
+                for e in equity_curve:
+                    rows.append(
+                        (
+                            run_id,
+                            parse_date(e.get("date")),
+                            e.get("equity"),
+                            e.get("drawdown"),
+                            e.get("cash"),
+                            e.get("positions"),
+                        )
+                    )
+                cur.executemany(
+                    """
+                    INSERT INTO backtest_equity_curve
+                      (run_id, trading_date, equity, drawdown, cash, positions_count)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    rows,
+                )
 
 
 def _safe_float(x) -> Optional[float]:
@@ -318,12 +438,14 @@ def entries_page(request: Request):
             "default_date": default_date,
             "default_side": "long",
             "default_limit": 50,
+            "default_entry_min_score": int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)),
         },
     )
 
 
 @app.get("/api/entries")
 def api_entries(
+    request: Request,
     trading_date: str = Query(..., description="YYYY-MM-DD"),
     side: str = Query("long", pattern="^(long|short)$"),
     limit: int = Query(50, ge=1, le=500),
@@ -331,7 +453,7 @@ def api_entries(
 ):
     d = parse_date(trading_date)
     entry_col = "entry_long" if side == "long" else "entry_short"
-    order = "DESC" if side == "long" else "ASC"
+    order = "DESC"
 
     allowed_strategies = {
         # long
@@ -353,6 +475,15 @@ def api_entries(
     if strategy is not None and strategy not in allowed_strategies:
         return {"date": trading_date, "side": side, "error": f"invalid strategy: {strategy}", "rows": []}
 
+    overrides = None
+    if "override" in request.query_params:
+        try:
+            overrides = json.loads(request.query_params["override"])
+        except Exception:
+            overrides = None
+
+    cfg = build_backtest_config(start=d, end=d, side=side, overrides=overrides)
+
     with db_conn() as conn:
         streaks: dict[str, int] = {}
         # 若指定 strategy 但 DB 欄位還沒跟上（尚未跑過 build_signals.py 觸發 ALTER），回傳可理解的訊息
@@ -365,22 +496,9 @@ def api_entries(
                     "error": f"DB 欄位不存在：{strategy}。請先執行 migration/重建 schema 後再查詢。",
                     "rows": [],
                 }
-        with conn.cursor() as cur:
-            where = f"trading_date=%s AND {entry_col}=1"
-            params = [d]
-            if strategy:
-                where += f" AND {strategy}=1"
-            cur.execute(
-                f"""
-                SELECT *
-                FROM stock_signals_v2
-                WHERE {where}
-                ORDER BY score {order}
-                LIMIT %s
-                """,
-                (*params, int(limit)),
-            )
-            rows = cur.fetchall()
+        rows = select_candidates(trading_date=d, side=side, cfg=cfg, limit=limit)
+        if strategy:
+            rows = [r for r in rows if int(r.get(strategy, 0) or 0) == 1]
 
         stock_ids = [r["stock_id"] for r in (rows or []) if r.get("stock_id")]
         streaks = _compute_entry_streaks(
@@ -394,45 +512,41 @@ def api_entries(
 
     out = []
     for r in rows:
-        close = _safe_float(r.get("close"))
-        ma20 = _safe_float(r.get("ma20"))
-        ma20_dist_pct = None
-        if close is not None and ma20 is not None and ma20 > 0:
-            ma20_dist_pct = (close / ma20 - 1.0) * 100.0
-
         out.append(
             {
                 "stock_id": r["stock_id"],
                 "trading_date": r["trading_date"].strftime("%Y-%m-%d") if r.get("trading_date") else None,
-                "market_regime": r.get("market_regime"),
-                "score": int(r.get("score", 0) or 0),
+                "side": side,
+                "score_long": int(r.get("score_long", 0) or 0),
+                "score_short": int(r.get("score_short", 0) or 0),
                 "primary_strategy": r.get("primary_strategy"),
+                "rationale_tags": _parse_rationale_tags(r.get("rationale_tags"), r, side),
+                "entry_flag": int(r.get(entry_col, 0) or 0),
+                "market_regime": r.get("market_regime"),
                 "on_list_streak": int(streaks.get(r["stock_id"], 0)),
-                "ma20_dist_pct": float(ma20_dist_pct) if ma20_dist_pct is not None else None,
-                "dist_40d_high_pct": float(r["dist_40d_high_pct"]) if r.get("dist_40d_high_pct") is not None else None,
-                "stop_loss_price": float(r["stop_loss_price"]) if r.get("stop_loss_price") is not None else None,
-                "stop_loss_pct": float(r["stop_loss_pct"]) if r.get("stop_loss_pct") is not None else None,
-                "tags": _fmt_tags(r, side),
+                "prob": r.get("entry_prob"),
             }
         )
 
-    return {"date": trading_date, "side": side, "strategy": strategy, "count": len(out), "rows": out}
+    return {"date": trading_date, "side": side, "strategy": strategy, "count": len(out), "rows": out, "config_hash": cfg.config_hash}
 
 @app.get("/api/rankings")
 def api_rankings(
+    request: Request,
     date: str = Query(..., description="YYYY-MM-DD"),
     side: str = Query("long", pattern="^(long|short)$"),
     limit: int = Query(50, ge=1, le=500),
     strategy: Optional[str] = Query(None, description="strat_* 欄位名（例如 strat_trust_breakout）"),
+    prob_gte: Optional[float] = Query(None, ge=0.0, le=1.0, description="若提供，僅保留 entry_prob >= prob_gte"),
 ):
     """
     Web MVP：統一榜單 API。
     回傳 schema：
-      symbol,name,date,side,score,primary_strategy,rationale_tags,entry_price,stop_price,entry_streak
+      stock_id,trading_date,side,score_long,score_short,primary_strategy,rationale_tags,entry_flag,market_regime
     """
     d = parse_date(date)
     entry_col = "entry_long" if side == "long" else "entry_short"
-    score_order = "DESC" if side == "long" else "ASC"
+    score_order = "DESC"
 
     allowed_strategies = {
         # long
@@ -454,27 +568,20 @@ def api_rankings(
     if strategy is not None and strategy not in allowed_strategies:
         return {"date": date, "side": side, "error": f"invalid strategy: {strategy}", "rows": []}
 
+    overrides = None
+    if "override" in request.query_params:
+        try:
+            overrides = json.loads(request.query_params["override"])
+        except Exception:
+            overrides = None
+    cfg = build_backtest_config(start=d, end=d, side=side, overrides=overrides, top_n=limit, strategy=strategy, prob_gte=prob_gte)
+
     with db_conn() as conn:
         if strategy:
             if not _has_column(conn, "stock_signals_v2", strategy):
                 return {"date": date, "side": side, "strategy": strategy, "error": f"DB 欄位不存在：{strategy}", "rows": []}
 
-        with conn.cursor() as cur:
-            where = f"trading_date=%s AND {entry_col}=1"
-            params = [d]
-            if strategy:
-                where += f" AND {strategy}=1"
-            cur.execute(
-                f"""
-                SELECT *
-                FROM stock_signals_v2
-                WHERE {where}
-                ORDER BY score {score_order}
-                LIMIT %s
-                """,
-                (*params, int(limit)),
-            )
-            rows = cur.fetchall() or []
+        rows = select_candidates(trading_date=d, side=side, cfg=cfg, limit=limit)
 
         stock_ids = [r["stock_id"] for r in rows if r.get("stock_id")]
         names = _get_stock_names(conn, stock_ids)
@@ -486,11 +593,7 @@ def api_rankings(
         symbol = r.get("stock_id")
         if not symbol:
             continue
-        rationale = r.get("rationale_tags")
-        if isinstance(rationale, (list, tuple)):
-            rationale_tags = list(rationale)
-        else:
-            rationale_tags = _fmt_rationale_tags(r, side)
+        rationale_tags = _parse_rationale_tags(r.get("rationale_tags"), r, side)
 
         stop_price = r.get("stop_loss_price")
         if stop_price is None:
@@ -503,19 +606,23 @@ def api_rankings(
 
         out.append(
             {
-                "symbol": symbol,
-                "name": names.get(symbol, ""),
-                "date": r["trading_date"].strftime("%Y-%m-%d") if r.get("trading_date") else None,
-                "side": side.upper(),
-                "score": int(r.get("score", 0) or 0),
+                "stock_id": symbol,
+                "trading_date": r["trading_date"].strftime("%Y-%m-%d") if r.get("trading_date") else None,
+                "side": side,
+                "score_long": int(r.get("score_long", 0) or 0),
+                "score_short": int(r.get("score_short", 0) or 0),
                 "primary_strategy": r.get("primary_strategy"),
                 "rationale_tags": rationale_tags,
+                "entry_flag": int(r.get(entry_col, 0) or 0),
+                "market_regime": r.get("market_regime"),
                 "entry_price": entry_prices.get(symbol),
                 "stop_price": float(stop_price) if stop_price is not None else None,
                 "entry_streak": int(streaks.get(symbol, 0)),
+                "name": names.get(symbol, ""),
+                "prob": r.get("entry_prob"),
             }
         )
-    return {"date": date, "side": side, "strategy": strategy, "count": len(out), "rows": out}
+    return {"date": date, "side": side, "strategy": strategy, "count": len(out), "rows": out, "config_hash": cfg.config_hash}
 
 
 @app.get("/api/symbols/{symbol}/signals")
@@ -614,12 +721,14 @@ def api_symbol_signals(
                 "name": name,
                 "date": d.strftime("%Y-%m-%d"),
                 "side": side.upper(),
-                "score": int(r.get("score", 0) or 0),
+                "score_long": int(r.get("score_long", 0) or 0),
+                "score_short": int(r.get("score_short", 0) or 0),
                 "primary_strategy": r.get("primary_strategy"),
-                "rationale_tags": _fmt_rationale_tags(r, side),
+                "rationale_tags": _parse_rationale_tags(r.get("rationale_tags"), r, side),
                 "entry_price": entry_px,
                 "stop_price": float(stop_price) if stop_price is not None else None,
                 "entry_streak": int(streak),
+                "prob": r.get("entry_prob"),
             }
         )
     return {"symbol": symbol, "name": name, "side": side, "count": len(out), "rows": out}
@@ -633,13 +742,13 @@ def api_backtest_summary(
     top_n: int = Query(20, ge=1, le=200),
     holding_days: int = Query(5, ge=0, le=60),
     min_abs_score: int = Query(0, ge=0, le=200),
-    entry_min_score: int = Query(25, ge=0, le=200),
-    exit_no_momentum_days: int = Query(2, ge=1, le=200),
+    entry_min_score: int = Query(int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)), ge=0, le=200),
+    exit_no_momentum_days: int = Query(int(_STRATEGY_CFG.get("backtest", {}).get("exit_no_momentum_days", 2)), ge=1, le=200),
     use_stop_loss: bool = Query(True),
     use_entry_exit_signals: bool = Query(True),
-    calendar_stock_id: str = Query(getattr(settings, "MARKET_PROXY_STOCK_ID", "0050")),
+    calendar_stock_id: str = Query(_STRATEGY_CFG.get("signals", {}).get("market_proxy_stock_id", getattr(settings, "MARKET_PROXY_STOCK_ID", "0050"))),
 ):
-    cfg = BacktestConfig(
+    cfg = build_backtest_config(
         start=parse_date(start),
         end=parse_date(end),
         side=side,
@@ -656,6 +765,153 @@ def api_backtest_summary(
     return {"config": out.get("config"), "summary": out.get("summary")}
 
 
+@app.post("/api/backtest/run")
+def api_backtest_run(payload: dict = Body(...)):
+    run_params_keys = {
+        "start",
+        "end",
+        "side",
+        "top_n",
+        "holding_days",
+        "min_abs_score",
+        "entry_min_score",
+        "exit_no_momentum_days",
+        "use_stop_loss",
+        "use_entry_exit_signals",
+        "calendar_stock_id",
+    }
+    start = payload.get("start")
+    end = payload.get("end")
+    if not start or not end:
+        return {"error": "start/end required", "summary": {}, "equity_curve": [], "trades": []}
+
+    overrides = {k: v for k, v in payload.items() if k not in run_params_keys and k != "overrides"}
+    if isinstance(payload.get("overrides"), dict):
+        overrides.update(payload["overrides"])
+
+    cfg = build_backtest_config(
+        start=parse_date(start),
+        end=parse_date(end),
+        side=payload.get("side", "long"),
+        overrides=overrides,
+        top_n=payload.get("top_n"),
+        holding_days=payload.get("holding_days"),
+        min_abs_score=payload.get("min_abs_score"),
+        entry_min_score=payload.get("entry_min_score"),
+        exit_no_momentum_days=payload.get("exit_no_momentum_days"),
+        use_stop_loss=payload.get("use_stop_loss"),
+        use_entry_exit_signals=payload.get("use_entry_exit_signals"),
+        calendar_stock_id=payload.get("calendar_stock_id"),
+    )
+    out = run_backtest(cfg)
+    run_id = out.get("run_id") or uuid4().hex
+    return {
+        "run_id": run_id,
+        "config": out.get("config"),
+        "summary": out.get("summary"),
+        "equity_curve": out.get("equity_curve"),
+        "trades": out.get("trades"),
+    }
+
+
+@app.get("/api/backtest/{run_id}/trades.csv")
+def api_backtest_trades_csv(run_id: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT stock_id, side, signal_date, entry_exec_date, entry_timing,
+                       entry_primary_strategy, entry_rationale_tags, entry_score, entry_prob,
+                       exit_date, entry_price, exit_price, ret_gross, ret_net, cost_paid, exit_reason, kpi_passed
+                FROM backtest_trades
+                WHERE run_id=%s
+                ORDER BY entry_exec_date, stock_id
+                """,
+                (run_id,),
+            )
+            rows = cur.fetchall() or []
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(
+        [
+            "stock_id",
+            "side",
+            "signal_date",
+            "entry_exec_date",
+            "entry_timing",
+            "entry_primary_strategy",
+            "entry_rationale_tags",
+            "entry_score",
+            "entry_prob",
+            "exit_date",
+            "entry_price",
+            "exit_price",
+            "ret_gross",
+            "ret_net",
+            "cost_paid",
+            "exit_reason",
+            "kpi_passed",
+        ]
+    )
+    for r in rows:
+        w.writerow(
+            [
+                r.get("stock_id"),
+                r.get("side"),
+                r.get("signal_date"),
+                r.get("entry_exec_date"),
+                r.get("entry_timing"),
+                r.get("entry_primary_strategy"),
+                r.get("entry_rationale_tags"),
+                r.get("entry_score"),
+                r.get("entry_prob"),
+                r.get("exit_date"),
+                r.get("entry_price"),
+                r.get("exit_price"),
+                r.get("ret_gross"),
+                r.get("ret_net"),
+                r.get("cost_paid"),
+                r.get("exit_reason"),
+                r.get("kpi_passed"),
+            ]
+        )
+    csv_text = buf.getvalue()
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="trades_{run_id}.csv"'},
+    )
+
+
+@app.get("/api/backtest/{run_id}/equity_curve.csv")
+def api_backtest_equity_curve_csv(run_id: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trading_date, equity, drawdown, cash, positions_count
+                FROM backtest_equity_curve
+                WHERE run_id=%s
+                ORDER BY trading_date
+                """,
+                (run_id,),
+            )
+            rows = cur.fetchall() or []
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["trading_date", "equity", "drawdown", "cash", "positions_count"])
+    for r in rows:
+        w.writerow([r.get("trading_date"), r.get("equity"), r.get("drawdown"), r.get("cash"), r.get("positions_count")])
+    csv_text = buf.getvalue()
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="equity_curve_{run_id}.csv"'},
+    )
+
+
 @app.get("/api/backtest/trades")
 def api_backtest_trades(
     start: str = Query(..., description="YYYY-MM-DD"),
@@ -664,14 +920,14 @@ def api_backtest_trades(
     top_n: int = Query(20, ge=1, le=200),
     holding_days: int = Query(5, ge=0, le=60),
     min_abs_score: int = Query(0, ge=0, le=200),
-    entry_min_score: int = Query(25, ge=0, le=200),
-    exit_no_momentum_days: int = Query(2, ge=1, le=200),
+    entry_min_score: int = Query(int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)), ge=0, le=200),
+    exit_no_momentum_days: int = Query(int(_STRATEGY_CFG.get("backtest", {}).get("exit_no_momentum_days", 2)), ge=1, le=200),
     use_stop_loss: bool = Query(True),
     use_entry_exit_signals: bool = Query(True),
-    calendar_stock_id: str = Query(getattr(settings, "MARKET_PROXY_STOCK_ID", "0050")),
+    calendar_stock_id: str = Query(_STRATEGY_CFG.get("signals", {}).get("market_proxy_stock_id", getattr(settings, "MARKET_PROXY_STOCK_ID", "0050"))),
     format: str = Query("json", pattern="^(json|csv)$"),
 ):
-    cfg = BacktestConfig(
+    cfg = build_backtest_config(
         start=parse_date(start),
         end=parse_date(end),
         side=side,
@@ -690,18 +946,48 @@ def api_backtest_trades(
     if format == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["side", "stock_id", "signal_date", "entry_date", "exit_date", "entry_px", "exit_px", "ret", "stopped"])
+        w.writerow(
+            [
+                "side",
+                "stock_id",
+                "signal_date",
+                "entry_exec_date",
+                "entry_timing",
+                "entry_primary_strategy",
+                "entry_rationale_tags",
+                "entry_score",
+                "entry_prob",
+                "exit_date",
+                "entry_price",
+                "exit_price",
+                "ret_gross",
+                "ret_net",
+                "cost_paid",
+                "exit_reason",
+                "kpi_passed",
+                "stopped",
+            ]
+        )
         for t in trades:
             w.writerow(
                 [
                     t.get("side"),
                     t.get("stock_id"),
                     t.get("signal_date"),
-                    t.get("entry_date"),
+                    t.get("entry_exec_date"),
+                    t.get("entry_timing"),
+                    t.get("entry_primary_strategy"),
+                    json.dumps(t.get("entry_rationale_tags"), ensure_ascii=False),
+                    t.get("entry_score"),
+                    t.get("entry_prob"),
                     t.get("exit_date"),
-                    t.get("entry_px"),
-                    t.get("exit_px"),
-                    t.get("ret"),
+                    t.get("entry_price"),
+                    t.get("exit_price"),
+                    t.get("ret_gross"),
+                    t.get("ret_net"),
+                    t.get("cost_paid"),
+                    t.get("exit_reason"),
+                    t.get("kpi_passed"),
                     t.get("stopped"),
                 ]
             )
@@ -723,13 +1009,13 @@ def api_backtest(
     top_n: int = Query(20, ge=1, le=200),
     holding_days: int = Query(5, ge=0, le=60, description="0 代表不固定持有天數（用 exit/沒動能/停損 出場）"),
     min_abs_score: int = Query(0, ge=0, le=200),
-    entry_min_score: int = Query(25, ge=0, le=200),
-    exit_no_momentum_days: int = Query(2, ge=1, le=200),
+    entry_min_score: int = Query(int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)), ge=0, le=200),
+    exit_no_momentum_days: int = Query(int(_STRATEGY_CFG.get("backtest", {}).get("exit_no_momentum_days", 2)), ge=1, le=200),
     use_stop_loss: bool = Query(True),
     use_entry_exit_signals: bool = Query(True),
-    calendar_stock_id: str = Query(getattr(settings, "MARKET_PROXY_STOCK_ID", "0050")),
+    calendar_stock_id: str = Query(_STRATEGY_CFG.get("signals", {}).get("market_proxy_stock_id", getattr(settings, "MARKET_PROXY_STOCK_ID", "0050"))),
 ):
-    cfg = BacktestConfig(
+    cfg = build_backtest_config(
         start=parse_date(start),
         end=parse_date(end),
         side=side,
@@ -742,7 +1028,17 @@ def api_backtest(
         exit_no_momentum_days=int(exit_no_momentum_days),
         calendar_stock_id=str(calendar_stock_id),
     )
-    return run_backtest(cfg)
+    try:
+        return run_backtest(cfg)
+    except Exception as e:
+        msg = str(e)
+        # MySQL: table doesn't exist
+        if "doesn't exist" in msg and "backtest_runs" in msg:
+            raise HTTPException(
+                status_code=500,
+                detail="回測落庫表不存在：請先套用 `migrations/20260115_backtest_tables.sql`（以及若有調整欄位則套用 `migrations/20260115_backtest_trades_entry_metadata.sql`）。",
+            )
+        raise
 
 
 @app.get("/api/stock_backtest")
@@ -751,8 +1047,8 @@ def api_stock_backtest(
     start: str = Query(..., description="YYYY-MM-DD"),
     end: str = Query(..., description="YYYY-MM-DD"),
     side: str = Query("long", pattern="^(long|short)$"),
-    entry_min_score: int = Query(25, ge=0, le=200),
-    exit_no_momentum_days: int = Query(2, ge=1, le=200),
+    entry_min_score: int = Query(int(_STRATEGY_CFG.get("scoring", {}).get("entry_min_score_long", 25)), ge=0, le=200),
+    exit_no_momentum_days: int = Query(int(_STRATEGY_CFG.get("backtest", {}).get("exit_no_momentum_days", 2)), ge=1, le=200),
     use_stop_loss: bool = Query(True),
     initial_capital: float = Query(1000000, gt=0, description="初始資金（用於計算總報酬%）"),
     position_sizing: str = Query("fixed", pattern="^(fixed|percent)$", description="部位大小：fixed=固定金額，percent=依資金比例（複利）"),
@@ -790,9 +1086,13 @@ def api_stock_backtest(
                 (stock_id, lookback_start, e),
             )
             bars_all = cur.fetchall()
+            prob_field = _STRATEGY_CFG.get("probability", {}).get("prob_field", "")
+            prob_col = f"{prob_field} AS entry_prob" if prob_field and _has_column(conn, "stock_signals_v2", prob_field) else "NULL AS entry_prob"
+            score_long_col = "score_long" if _has_column(conn, "stock_signals_v2", "score_long") else "score AS score_long"
+            score_short_col = "score_short" if _has_column(conn, "stock_signals_v2", "score_short") else "ABS(score) AS score_short"
             cur.execute(
-                """
-                SELECT trading_date, score, market_regime,
+                f"""
+                SELECT trading_date, {score_long_col}, {score_short_col}, market_regime,
                        entry_long, entry_short, exit_long, exit_short,
                        stop_loss_price,
                        close, ma20,
@@ -801,7 +1101,8 @@ def api_stock_backtest(
                        strat_volume_momentum, strat_price_volume_new_high, strat_trust_breakout, strat_trust_momentum_buy,
                        strat_foreign_big_buy, strat_co_buy,
                        strat_volume_momentum_weak, strat_price_volume_new_low, strat_trust_breakdown, strat_trust_momentum_sell,
-                       strat_foreign_big_sell, strat_co_sell
+                       strat_foreign_big_sell, strat_co_sell,
+                       {prob_col}
                 FROM stock_signals_v2
                 WHERE stock_id=%s AND trading_date BETWEEN %s AND %s
                 ORDER BY trading_date
@@ -892,7 +1193,7 @@ def api_stock_backtest(
         return tags
 
     def entry_reason(sig):
-        score = int(sig.get("score", 0) or 0)
+        score = int(sig.get("score_long", 0) or 0) if side == "long" else int(sig.get("score_short", 0) or 0)
         regime = sig.get("market_regime") or "unknown"
         tags = _fmt_tags(sig, side)
         tag_txt = "、".join(tags) if tags else "（無策略標籤）"
@@ -923,12 +1224,13 @@ def api_stock_backtest(
 
         # 進場判斷（用 entry_*，且再加一層 entry_min_score）
         if not in_pos:
-            score = int(sig.get("score", 0) or 0)
+            score_long = int(sig.get("score_long", 0) or 0)
+            score_short = int(sig.get("score_short", 0) or 0)
             can_entry = False
             if side == "long":
-                can_entry = int(sig.get("entry_long", 0) or 0) == 1 and score >= int(entry_min_score)
+                can_entry = int(sig.get("entry_long", 0) or 0) == 1 and score_long >= int(entry_min_score)
             else:
-                can_entry = int(sig.get("entry_short", 0) or 0) == 1 and score <= -int(entry_min_score)
+                can_entry = int(sig.get("entry_short", 0) or 0) == 1 and score_short >= int(entry_min_score)
 
             if can_entry:
                 d_next = dates[i + 1]

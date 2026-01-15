@@ -25,17 +25,17 @@ def require_finmind_token() -> str:
         raise RuntimeError(
             "缺少環境變數 FINMIND_API_TOKEN。"
             "請先設定：export FINMIND_API_TOKEN='...'\n"
-            "（參考 env.example / README）"
+            "（參考 .env.example / README）"
         )
     return token
 FINMIND_API_URL = os.getenv("FINMIND_API_URL", "http://api.finmindtrade.com/api/v4/data")
 
-DB_HOST = "127.0.0.1"
-DB_PORT = 3307
-DB_USER = "root"
-DB_PASS = "root"
-DB_NAME = "stock_test2"
-DB_CHARSET = "utf8mb4"
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3307"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASS", "root")
+DB_NAME = os.getenv("DB_NAME", "stock_test2")
+DB_CHARSET = os.getenv("DB_CHARSET", "utf8mb4")
 
 # ==========================
 # Signals / 動能選股設定

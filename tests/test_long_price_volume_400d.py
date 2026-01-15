@@ -3,6 +3,9 @@ from datetime import date, timedelta
 
 
 from etl.build_signals import calc_kbar_signals, calc_strategies_and_score
+from configs.strategy_loader import load_strategy_config
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 
 def _base_sig():
@@ -101,7 +104,7 @@ class TestLongPriceVolumeNewHigh400d(unittest.TestCase):
         sig["is_price_breakout_400d"] = 1
         sig["is_volume_breakout_10d"] = 1
         sig["yesterday_turnover"] = 600_000_000
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_price_volume_new_high", 0)), 1)
 
     def test_strategy_fail_when_turnover_low(self):
@@ -109,7 +112,7 @@ class TestLongPriceVolumeNewHigh400d(unittest.TestCase):
         sig["is_price_breakout_400d"] = 1
         sig["is_volume_breakout_10d"] = 1
         sig["yesterday_turnover"] = 100_000_000
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_price_volume_new_high", 0)), 0)
 
 

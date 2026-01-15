@@ -2,6 +2,9 @@ import unittest
 
 
 from etl.build_signals import calc_strategies_and_score
+from configs.strategy_loader import load_strategy_config
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 
 def _base_sig():
@@ -57,7 +60,7 @@ class TestStrategy3_4_5Long(unittest.TestCase):
         sig["momentum_score"] = 8.0
         sig["yesterday_turnover"] = 600_000_000
         sig["trust_buy_streak"] = 2
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_trust_momentum_buy", 0)), 1)
 
     def test_strategy4_foreign_first_buy(self):
@@ -65,7 +68,7 @@ class TestStrategy3_4_5Long(unittest.TestCase):
         sig["momentum_score"] = 9.0
         sig["yesterday_turnover"] = 900_000_000
         sig["is_foreign_first_buy"] = 1
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_foreign_big_buy", 0)), 1)
 
     def test_strategy5_co_buy_threshold(self):
@@ -75,7 +78,7 @@ class TestStrategy3_4_5Long(unittest.TestCase):
         sig["is_co_buy"] = 1
         sig["foreign_net"] = 60_000_000
         sig["trust_net"] = 1
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_co_buy", 0)), 1)
 
 

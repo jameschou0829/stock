@@ -3,6 +3,9 @@ from datetime import date, timedelta
 
 
 from etl.build_signals import calc_kbar_signals, calc_strategies_and_score
+from configs.strategy_loader import load_strategy_config
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 
 def _base_sig():
@@ -84,7 +87,7 @@ class TestStrategy2TrustBreakout(unittest.TestCase):
         sig["yesterday_turnover"] = 600_000_000
         sig["trust_net_3d"] = 10
 
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_trust_breakout", 0)), 1)
 
     def test_strategy2_fail_when_turnover_low(self):
@@ -92,7 +95,7 @@ class TestStrategy2TrustBreakout(unittest.TestCase):
         sig["is_near_40d_high"] = 1
         sig["yesterday_turnover"] = 100_000_000
         sig["trust_net_3d"] = 10
-        out = calc_strategies_and_score("range", sig)
+        out = calc_strategies_and_score("range", sig, _STRATEGY_CFG)
         self.assertEqual(int(out.get("strat_trust_breakout", 0)), 0)
 
 

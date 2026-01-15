@@ -4,6 +4,7 @@ from typing import Optional
 
 from utils.db import db_conn
 from utils.fetcher import FinMindPaymentRequiredError, FinMindAuthError, finmind_get_data
+from utils.fetch_log import get_last_date as _get_last_date, upsert_fetch_log as _upsert_fetch_log
 
 TABLE_NAME = "institution_trading"
 DEFAULT_START_DATE = date(2015, 1, 1)
@@ -22,35 +23,6 @@ def _parse_finmind_date(v):
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
-
-
-# -----------------------------
-# DB helpers
-# -----------------------------
-def get_last_date(conn, stock_id):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT last_date
-            FROM fetch_log
-            WHERE table_name=%s AND stock_id=%s
-            """,
-            (TABLE_NAME, stock_id),
-        )
-        row = cur.fetchone()
-        return row["last_date"] if row else None
-
-
-def update_fetch_log(conn, stock_id, last_date):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO fetch_log (table_name, stock_id, last_date)
-            VALUES (%s, %s, %s)
-            ON DUPLICATE KEY UPDATE last_date=VALUES(last_date)
-            """,
-            (TABLE_NAME, stock_id, last_date),
-        )
 
 
 # -----------------------------
@@ -155,7 +127,7 @@ def run_institution(stock_id, end_date: Optional[date] = None):
         end_date = date.today()
     try:
         with db_conn(commit_on_success=True) as conn:
-            last_date = get_last_date(conn, stock_id)
+            last_date = _get_last_date(TABLE_NAME, stock_id)
 
             if last_date:
                 start_date = last_date + timedelta(days=1)
@@ -180,7 +152,7 @@ def run_institution(stock_id, end_date: Optional[date] = None):
             save_institution(conn, stock_id, daily)
 
             max_date = max(daily.keys())
-            update_fetch_log(conn, stock_id, max_date)
+            _upsert_fetch_log(TABLE_NAME, stock_id, max_date)
 
             print(f"[OK] 法人完成 {stock_id} ({len(daily)} 天)")
 

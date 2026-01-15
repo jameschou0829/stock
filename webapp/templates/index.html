@@ -89,6 +89,11 @@
       <div id="stockTable"></div>
     </div>
 
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:8px;">交易明細（trades）</div>
+      <div id="tradesTable"></div>
+    </div>
+
     <script>
       let chart;
       function getVal(id) { return document.getElementById(id).value; }
@@ -191,7 +196,7 @@
             map.set(sid, { stock_id: sid, trades: 0, wins: 0, sum: 0 });
           }
           const x = map.get(sid);
-          const r = Number(t.ret || 0);
+          const r = Number(t.ret_net ?? t.ret ?? 0);
           x.trades += 1;
           x.sum += r;
           if (r > 0) x.wins += 1;
@@ -238,6 +243,50 @@
         document.getElementById('stockTable').innerHTML = html;
       }
 
+      function renderTradesTable(trades) {
+        const rows = (trades || []).slice(0, 500);
+        const pct = (v) => (v * 100).toFixed(2) + '%';
+        const prob = (v) => (v === null || v === undefined) ? '' : (Number(v) * 100).toFixed(2) + '%';
+        const html = rows.length ? `
+          <table style="width:100%; border-collapse: collapse;">
+            <thead>
+              <tr>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">stock_id</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">side</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">signal_date</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">entry_exec_date</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">entry_timing</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">primary_strategy</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">rationale_tags</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">entry_score</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">entry_prob</th>
+                <th style="text-align:right; border-bottom:1px solid #eee; padding:6px;">ret_net</th>
+                <th style="text-align:left; border-bottom:1px solid #eee; padding:6px;">exit_reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(t => `
+                <tr>
+                  <td style="padding:6px;">${t.stock_id}</td>
+                  <td style="padding:6px;">${t.side}</td>
+                  <td style="padding:6px;">${t.signal_date || ''}</td>
+                  <td style="padding:6px;">${t.entry_exec_date || ''}</td>
+                  <td style="padding:6px;">${t.entry_timing || ''}</td>
+                  <td style="padding:6px;">${t.entry_primary_strategy || ''}</td>
+                  <td style="padding:6px;">${(t.entry_rationale_tags || []).map(x => `<span style="display:inline-block; padding:2px 6px; border-radius:999px; background:#f3f4f6; margin-right:4px; font-size:12px;">${x}</span>`).join('')}</td>
+                  <td style="padding:6px; text-align:right;">${Number(t.entry_score || 0).toFixed(0)}</td>
+                  <td style="padding:6px; text-align:right;">${prob(t.entry_prob)}</td>
+                  <td style="padding:6px; text-align:right;">${pct(Number(t.ret_net ?? t.ret ?? 0))}</td>
+                  <td style="padding:6px;">${t.exit_reason || ''}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="hint">為避免頁面太重，最多顯示前 500 筆 trades。</div>
+        ` : `<div class="hint">沒有 trades 可顯示。</div>`;
+        document.getElementById('tradesTable').innerHTML = html;
+      }
+
       async function run() {
         const btn = document.getElementById('runBtn');
         btn.disabled = true;
@@ -274,6 +323,7 @@
           renderSummary(json.summary);
           document.getElementById('raw').textContent = JSON.stringify(json.config, null, 2);
           renderStockTable(json.trades || []);
+          renderTradesTable(json.trades || []);
         } finally {
           btn.disabled = false;
         }

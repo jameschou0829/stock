@@ -87,7 +87,7 @@
           start: d,
           end: d,
           side: side,
-          entry_min_score: '25',
+          entry_min_score: String({{ default_entry_min_score }}),
           exit_no_momentum_days: '2',
           use_stop_loss: 'true',
           initial_capital: '1000000',
@@ -143,6 +143,7 @@
           symbol: { type: 'str' },
           name: { type: 'str' },
           score: { type: 'num' },
+          prob: { type: 'num' },
           entry_streak: { type: 'num' },
           entry_price: { type: 'num' },
           stop_price: { type: 'num' },
@@ -170,7 +171,13 @@
 
       function render(data) {
         currentData = data;
-        const rows = (data && data.rows) ? data.rows : [];
+        const rowsRaw = (data && data.rows) ? data.rows : [];
+        const rows = rowsRaw.map(r => {
+          const symbol = r.stock_id ?? r.symbol;
+          const score = (data.side === 'short') ? Number(r.score_short ?? 0) : Number(r.score_long ?? 0);
+          const prob = (r.prob !== undefined && r.prob !== null) ? Number(r.prob) : null;
+          return { ...r, symbol, score, prob };
+        });
         document.getElementById('meta').innerHTML =
           `<div><b>日期</b>: ${esc(data.date)}　<b>方向</b>: ${esc(data.side)}　<b>策略</b>: ${esc(data.strategy || '全部')}　<b>筆數</b>: ${rows.length}</div>`;
 
@@ -191,6 +198,7 @@
                 <th class="sortable" onclick="setSort('symbol')">symbol${sortArrow('symbol')}</th>
                 <th class="sortable" onclick="setSort('name')">name${sortArrow('name')}</th>
                 <th class="num sortable" onclick="setSort('score')">score${sortArrow('score')}</th>
+                <th class="num sortable" onclick="setSort('prob')">prob${sortArrow('prob')}</th>
                 <th>primary</th>
                 <th class="num sortable" onclick="setSort('entry_streak')">entry_streak${sortArrow('entry_streak')}</th>
                 <th class="num sortable" onclick="setSort('entry_price')">entry_price${sortArrow('entry_price')}</th>
@@ -205,6 +213,7 @@
                   <td><a href="/stock/${esc(r.symbol)}" target="_blank">${esc(r.symbol)}</a></td>
                   <td class="muted">${esc(r.name || '')}</td>
                   <td class="num">${esc(r.score)}</td>
+                  <td class="num">${esc(fmtPctFromFraction(r.prob))}</td>
                   <td class="muted">${esc(r.primary_strategy || '')}</td>
                   <td class="num">${esc(r.entry_streak ?? '')}</td>
                   <td class="num">${esc(fmtNum(r.entry_price, 2))}</td>

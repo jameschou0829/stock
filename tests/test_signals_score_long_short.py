@@ -1,6 +1,9 @@
 import unittest
 
 from etl.build_signals import calc_strategies_and_score
+from configs.strategy_loader import load_strategy_config
+
+_STRATEGY_CFG, _, _ = load_strategy_config({})
 
 
 def _base_sig():
@@ -52,7 +55,7 @@ def _base_sig():
 class TestSignalsScoreLongShort(unittest.TestCase):
     def test_score_long_and_entry_long(self):
         sig = _base_sig()
-        out = calc_strategies_and_score("bull", sig)
+        out = calc_strategies_and_score("bull", sig, _STRATEGY_CFG)
         self.assertGreater(int(out.get("score_long", 0)), 0)
         self.assertEqual(int(out.get("entry_long", 0)), 1)
 
@@ -68,7 +71,7 @@ class TestSignalsScoreLongShort(unittest.TestCase):
         sig["is_co_sell"] = 1
         sig["is_foreign_first_sell"] = 1
         sig["is_trust_first_sell"] = 1
-        out = calc_strategies_and_score("bear", sig)
+        out = calc_strategies_and_score("bear", sig, _STRATEGY_CFG)
         self.assertGreaterEqual(int(out.get("score_short", 0)), 0)
         self.assertEqual(int(out.get("entry_short", 0)), 1)
 
@@ -83,8 +86,8 @@ class TestSignalsScoreLongShort(unittest.TestCase):
         sig["is_co_sell"] = 1
         sig["is_foreign_first_sell"] = 1
         sig["is_trust_first_sell"] = 1
-        out_bear = calc_strategies_and_score("bear", dict(sig))
-        out_bull = calc_strategies_and_score("bull", dict(sig))
+        out_bear = calc_strategies_and_score("bear", dict(sig), _STRATEGY_CFG)
+        out_bull = calc_strategies_and_score("bull", dict(sig), _STRATEGY_CFG)
         self.assertGreaterEqual(int(out_bear.get("score_short", 0)), int(out_bull.get("score_short", 0)))
 
 

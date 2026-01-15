@@ -16,21 +16,28 @@ def main():
     ap.add_argument("--min-abs-score", type=int, default=0)
     ap.add_argument("--use-stop-loss", action="store_true")
     ap.add_argument("--use-entry-exit-signals", action="store_true", help="用 signals 的 entry/exit 規則（可調 entry_min_score）")
-    ap.add_argument("--entry-min-score", type=int, default=getattr(settings, "SIGNALS_ENTRY_MIN_SCORE", 25))
+    ap.add_argument("--entry-min-score", type=int, default=None)
+    ap.add_argument("--override", type=str, default=None, help="JSON 覆蓋 strategy.yaml（例如 '{\"costs\":{\"commission_bps\":10}}')")
     ap.add_argument("--exit-no-momentum-days", type=int, default=2, help="沒量沒動能連續 N 天則出場（holding_days=0 時特別有用）")
     ap.add_argument("--calendar-stock-id", default=getattr(settings, "MARKET_PROXY_STOCK_ID", "0050"))
     args = ap.parse_args()
 
-    from backtest.engine import BacktestConfig, run_backtest, parse_date
+    from backtest.engine import build_backtest_config, run_backtest, parse_date
+    import json
 
-    cfg = BacktestConfig(
+    overrides = None
+    if args.override:
+        overrides = json.loads(args.override)
+
+    cfg = build_backtest_config(
         start=parse_date(args.start),
         end=parse_date(args.end),
         side=args.side,
+        overrides=overrides,
         top_n=int(args.top_n),
         holding_days=int(args.holding_days),
         min_abs_score=int(args.min_abs_score),
-        entry_min_score=int(args.entry_min_score),
+        entry_min_score=int(args.entry_min_score) if args.entry_min_score is not None else None,
         use_stop_loss=bool(args.use_stop_loss),
         use_entry_exit_signals=bool(args.use_entry_exit_signals),
         exit_no_momentum_days=int(args.exit_no_momentum_days),
